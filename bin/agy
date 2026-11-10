@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Bash wrapper shim for Antigravity CLI (`agy`) supporting `--visualize-tokens`.
+set -euo pipefail
+
+resolve_realpath() {
+  local target="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$target"
+  else
+    local dir base
+    dir="$(cd "$(dirname "$target")" && pwd -P)"
+    base="$(basename "$target")"
+    printf '%s/%s\n' "$dir" "$base"
+  fi
+}
+
+SELF_REAL="$(resolve_realpath "${BASH_SOURCE[0]}")"
+SHIM_DIR="$(cd "$(dirname "$SELF_REAL")" && pwd -P)"
+PROJECT_ROOT="$(cd "$SHIM_DIR/.." && pwd -P)"
+
+discover_real_agy() {
+  if [[ -n "${AGY_REAL_BIN:-}" ]]; then
+    if [[ -x "$AGY_REAL_BIN" ]]; then
+      printf '%s\n' "$AGY_REAL_BIN"
+      return 0
+    fi
+  fi
+
+  local entry candidate cand_real
+  local IFS=':'
+  for entry in ${PATH:-}; do
+    [[ -z "$entry" || ! -d "$entry" ]] && continue
+    candidate="${entry%/}/agy"
+    if [[ -f "$candidate" && -x "$candidate" ]]; then
+      cand_real="$(resolve_realpath "$candidate")"
+      if [[ "$cand_real" != "$SELF_REAL" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    fi
+  done
+
+  if [[ -x "$HOME/.local/bin/agy" ]]; then
+    cand_real="$(resolve_realpath "$HOME/.local/bin/agy")"
+    if [[ "$cand_real" != "$SELF_REAL" ]]; then
+      printf '%s\n' "$HOME/.local/bin/agy"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+ENABLE_VIZ=0
+VIZ_ARGS=()
+AGY_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --visualize-tokens)
+      ENABLE_VIZ=1
+      shift
+      ;;
+    --viz-include-history|--viz-heuristic-only|--viz-preload-only)
+      ENABLE_VIZ=1
+      VIZ_ARGS+=("$1")
+      shift
+      ;;
+    --viz-model|--viz-model-file|--viz-model-dir|--viz-categories|--viz-config|--viz-agy-bin)
+      ENABLE_VIZ=1
+      if [[ $# -lt 2 ]]; then
+        echo "[agy-token-viz] Error: $1 requires a value." >&2
+        exit 2
+      fi
+      VIZ_ARGS+=("$1" "$2")
+      shift 2
+      ;;
+    --viz-model=*|--viz-model-file=*|--viz-model-dir=*|--viz-categories=*|--viz-config=*|--viz-agy-bin=*)
+      ENABLE_VIZ=1
+      VIZ_ARGS+=("$1")
+      shift
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        AGY_ARGS+=("$1")
+        shift
+      done
+      ;;
+    *)
+      AGY_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# Allow preloading weights even if `agy` is not needed
+for arg in "${VIZ_ARGS[@]:-}"; do
+  if [[ "$arg" == "--viz-preload-only" ]]; then
+    PYTHON_BIN="${AGY_VIZ_PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
+    PYTHONPATH="$PROJECT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}" \
+      exec "$PYTHON_BIN" -m agy_token_viz.cli "${VIZ_ARGS[@]}"
+  fi
+done
+
+if ! REAL_AGY="$(discover_real_agy)"; then
+  echo "[agy-token-viz] Error: Could not locate the underlying 'agy' CLI binary." >&2
+  echo "Install Antigravity CLI or set AGY_REAL_BIN=/path/to/agy." >&2
+  exit 127
+fi
+
+# Zero-overhead pass-through when --visualize-tokens is not requested
+if [[ "$ENABLE_VIZ" -eq 0 ]]; then
+  exec "$REAL_AGY" ${AGY_ARGS[@]+"${AGY_ARGS[@]}"}
+fi
+
+PYTHON_BIN="${AGY_VIZ_PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "[agy-token-viz] Error: Python runtime not found at $PYTHON_BIN" >&2
+  exit 1
+fi
+
+export AGY_REAL_BIN="$REAL_AGY"
+export PYTHONPATH="$PROJECT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PYTHON_BIN" -m agy_token_viz.cli \
+  ${VIZ_ARGS[@]+"${VIZ_ARGS[@]}"} \
+  -- \
+  ${AGY_ARGS[@]+"${AGY_ARGS[@]}"}
