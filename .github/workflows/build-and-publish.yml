@@ -1,0 +1,138 @@
+name: Test, Build, and Publish
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Create project virtualenv & install dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install \
+            --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
+            -e ".[dev]"
+
+      - name: Run pytest suite
+        run: |
+          .venv/bin/pytest -v
+
+      - name: Verify CLI entrypoint
+        run: |
+          .venv/bin/agy-token-viz --help
+
+  build:
+    name: Build Package & Bundle
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Read package version
+        id: meta
+        run: |
+          VERSION="$(python -c 'import tomllib, pathlib; data = tomllib.loads(pathlib.Path("pyproject.toml").read_text()); print(data["project"]["version"])')"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Detected package version: ${VERSION}"
+
+      - name: Build Python sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build --sdist --wheel --outdir dist/
+          twine check dist/*
+
+      - name: Create standalone CLI bundle & checksums
+        env:
+          PKG_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          BUNDLE_NAME="agy-token-viz-${PKG_VERSION}-bundle"
+          STAGE_DIR="$(mktemp -d)/${BUNDLE_NAME}"
+          mkdir -p "${STAGE_DIR}"
+
+          cp -r bin scripts README.md LIMITATIONS.md pyproject.toml "${STAGE_DIR}/"
+          mkdir -p "${STAGE_DIR}/wheels"
+          cp dist/*.whl "${STAGE_DIR}/wheels/"
+
+          tar -C "$(dirname "${STAGE_DIR}")" -czf "dist/${BUNDLE_NAME}.tar.gz" "${BUNDLE_NAME}"
+          (
+            cd dist
+            sha256sum *.whl *.tar.gz > SHA256SUMS.txt
+          )
+          ls -lh dist/
+          cat dist/SHA256SUMS.txt
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: agy-token-viz-dist
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish Release
+    needs:
+      - test
+      - build
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: agy-token-viz-dist
+          path: dist/
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PKG_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+            RELEASE_TITLE="agy-token-viz ${TAG_NAME}"
+          else
+            SHORT_SHA="$(git rev-parse --short HEAD)"
+            TAG_NAME="v${PKG_VERSION}-build.${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
+            RELEASE_TITLE="agy-token-viz v${PKG_VERSION} (build #${GITHUB_RUN_NUMBER} - ${SHORT_SHA})"
+          fi
+
+          echo "Publishing release ${TAG_NAME}..."
+          gh release create "${TAG_NAME}" dist/* \
+            --title "${RELEASE_TITLE}" \
+            --generate-notes \
+            --target "${GITHUB_SHA}"
