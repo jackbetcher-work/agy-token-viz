@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Bash wrapper shim for Jetski CLI (`jetski`) supporting `--visualize-tokens`.
+set -euo pipefail
+
+resolve_realpath() {
+  local target="$1"
+  local dir base link
+  while [[ -L "$target" ]]; do
+    dir="$(cd -P "$(dirname "$target")" && pwd -P)"
+    link="$(readlink "$target")"
+    if [[ "$link" == /* ]]; then
+      target="$link"
+    else
+      target="$dir/$link"
+    fi
+  done
+  dir="$(cd -P "$(dirname "$target")" && pwd -P)"
+  base="$(basename "$target")"
+  printf '%s/%s\n' "$dir" "$base"
+}
+
+SELF_REAL="$(resolve_realpath "${BASH_SOURCE[0]}")"
+SHIM_DIR="$(cd "$(dirname "$SELF_REAL")" && pwd -P)"
+SHIM_TARGET="jetski"
+
+# shellcheck source=bin/_token_viz_shim.sh
+source "$SHIM_DIR/_token_viz_shim.sh"

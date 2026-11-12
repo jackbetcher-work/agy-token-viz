@@ -1,4 +1,4 @@
-"""Real-time watcher for Antigravity CLI transcript.jsonl and transcript_full.jsonl files."""
+"""Real-time watcher for Antigravity (`agy`) and Jetski (`jetski`) transcript JSONL files."""
 
 from __future__ import annotations
 
@@ -9,12 +9,14 @@ import re
 import threading
 from typing import Any, Callable, Sequence
 
+from agy_token_viz.config import extract_data_dir_from_args
 from agy_token_viz.state import StepRecord, ToolCallSummary
 from agy_token_viz.tokenizer import count_tokens_locally, serialize_tool_calls_verbatim
 
 
 _UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 _UUID_RE = re.compile(_UUID_PATTERN)
+_CLI_LOG_APP_DATA_DIR_RE = re.compile(r"\bCLI app data directory:\s+(.+)$")
 _CLI_LOG_CREATED_CONV_RE = re.compile(rf"\bCreated conversation ({_UUID_PATTERN})\b")
 _CLI_LOG_ATTACHED_CONV_RE = re.compile(
     rf"\b(?:Streaming conversation|Starting conversation update stream for|"
@@ -23,43 +25,124 @@ _CLI_LOG_ATTACHED_CONV_RE = re.compile(
 )
 
 
+def _conversation_id_from_path_arg(raw_path: str) -> str | None:
+    cleaned = raw_path.strip()
+    if not cleaned:
+        return None
+    uuid_match = _UUID_RE.search(cleaned)
+    if uuid_match:
+        return uuid_match.group(0)
+    stem = Path(cleaned).stem.strip()
+    return stem or None
+
+
 def extract_target_conversation_from_args(agy_args: Sequence[str]) -> str | None:
-    """Inspect forwarded `agy` CLI flags for an explicit `--conversation <id>` argument."""
+    """Inspect forwarded CLI flags for an explicit `--conversation` or `--conversation_path` target."""
+    conv_flags = {"--conversation", "-conversation"}
+    conv_path_flags = {
+        "--conversation_path",
+        "-conversation_path",
+        "--conversation-path",
+        "-conversation-path",
+    }
     args = list(agy_args)
     for idx, token in enumerate(args):
-        if token == "--conversation" and idx + 1 < len(args):
+        if token == "--":
+            break
+        if token in conv_flags and idx + 1 < len(args):
             val = args[idx + 1].strip()
             return val or None
-        if token.startswith("--conversation="):
-            val = token.split("=", 1)[1].strip()
-            return val or None
+        for prefix in conv_flags:
+            if token.startswith(f"{prefix}="):
+                val = token.split("=", 1)[1].strip()
+                return val or None
+        if token in conv_path_flags and idx + 1 < len(args):
+            return _conversation_id_from_path_arg(args[idx + 1])
+        for prefix in conv_path_flags:
+            if token.startswith(f"{prefix}="):
+                return _conversation_id_from_path_arg(token.split("=", 1)[1])
     return None
 
 
 def is_resuming_conversation_from_args(agy_args: Sequence[str]) -> bool:
-    """Return True if forwarded `agy` CLI flags resume an existing conversation (`-c`, `--continue`, `--conversation`)."""
+    """Return True if forwarded CLI flags resume an existing conversation (`-c`, `--continue`, `--conversation`, `--conversation_path`)."""
+    resume_flags = {
+        "-c",
+        "--continue",
+        "-continue",
+        "--conversation",
+        "-conversation",
+        "--conversation_path",
+        "-conversation_path",
+        "--conversation-path",
+        "-conversation-path",
+    }
+    resume_prefixes = (
+        "--conversation=",
+        "-conversation=",
+        "--conversation_path=",
+        "-conversation_path=",
+        "--conversation-path=",
+        "-conversation-path=",
+    )
     for token in agy_args:
-        if token in ("-c", "--continue", "--conversation") or token.startswith("--conversation="):
+        if token == "--":
+            break
+        if token in resume_flags or token.startswith(resume_prefixes):
             return True
     return False
 
 
 def extract_log_file_from_args(agy_args: Sequence[str]) -> Path | None:
-    """Inspect forwarded `agy` CLI flags for an explicit `--log-file <path>` override."""
+    """Inspect forwarded CLI flags for an explicit `--log-file` or `--cli_log_file` override."""
+    log_flags = {
+        "--log-file",
+        "-log-file",
+        "--cli_log_file",
+        "-cli_log_file",
+        "--cli-log-file",
+        "-cli-log-file",
+    }
     args = list(agy_args)
     for idx, token in enumerate(args):
-        if token == "--log-file" and idx + 1 < len(args):
+        if token == "--":
+            break
+        if token in log_flags and idx + 1 < len(args):
             val = args[idx + 1].strip()
             return Path(val).expanduser() if val else None
-        if token.startswith("--log-file="):
-            val = token.split("=", 1)[1].strip()
-            return Path(val).expanduser() if val else None
+        for prefix in log_flags:
+            if token.startswith(f"{prefix}="):
+                val = token.split("=", 1)[1].strip()
+                return Path(val).expanduser() if val else None
     return None
 
 
 def _summarize_tool_args(tool_name: str, args: dict[str, Any]) -> str:
     """Create a short human-readable hint from tool call arguments for classification."""
-    for key in ("Path", "CommandLine", "query", "toolSummary", "Pattern", "Role"):
+    if tool_name == "swarm":
+        action = str(args.get("action") or "").strip()
+        detail = str(
+            args.get("name") or args.get("title") or args.get("brief") or ""
+        ).strip()
+        combined = f"{action} {detail}".strip() if action else detail
+        if combined:
+            return combined[:240]
+
+    for key in (
+        "Path",
+        "CommandLine",
+        "query",
+        "toolSummary",
+        "Pattern",
+        "Role",
+        "Description",
+        "ScriptPath",
+        "Action",
+        "action",
+        "brief",
+        "Name",
+        "Prompt",
+    ):
         val = args.get(key)
         if isinstance(val, str) and val.strip():
             cleaned = val.strip().strip('"').strip("'")
@@ -273,21 +356,29 @@ class TranscriptWatcher:
 
     def __init__(
         self,
-        agy_data_dir: Path,
-        on_step: Callable[[StepRecord], None],
+        agy_data_dir: Path | None = None,
+        on_step: Callable[[StepRecord], None] | None = None,
         target_conversation_id: str | None = None,
         include_history: bool = False,
         poll_interval: float = 0.15,
         *,
+        data_dir: Path | None = None,
+        log_subdirs: Sequence[str] = ("log", "cli/log"),
         exclude_preexisting: bool = False,
         lock_to_first_conversation: bool = False,
         on_baseline_context: Callable[[str, int, int, int], None] | None = None,
         on_reset: Callable[[], None] | None = None,
         explicit_log_file: Path | None = None,
     ) -> None:
-        self._agy_data_dir = agy_data_dir.expanduser()
+        resolved_dir = data_dir if data_dir is not None else agy_data_dir
+        if resolved_dir is None:
+            raise TypeError("TranscriptWatcher requires `agy_data_dir` (or `data_dir`).")
+        if on_step is None:
+            raise TypeError("TranscriptWatcher requires `on_step`.")
+        self._agy_data_dir = resolved_dir.expanduser()
         self._brain_dir = self._agy_data_dir / "brain"
-        self._log_dir = self._agy_data_dir / "log"
+        self._log_subdirs: tuple[str, ...] = tuple(log_subdirs) or ("log", "cli/log")
+        self._log_dir = self._agy_data_dir / self._log_subdirs[0]
         self._on_step = on_step
         self._target_conversation_id = target_conversation_id
         self._allowed_conversations: set[str] = (
@@ -536,27 +627,49 @@ class TranscriptWatcher:
             self._stop_event.wait(self._poll_interval)
 
     def _discover_cli_log_for_pid(self, pid: int) -> Path | None:
-        """Locate the `cli-*.log` file created by our spawned `agy` child process `pid`."""
+        """Locate the `cli-*.log` file created by our spawned `agy` or `jetski` child process `pid`."""
         if self._explicit_log_file is not None and self._explicit_log_file.is_file():
             return self._explicit_log_file
 
-        if not self._log_dir.is_dir():
+        log_dirs = [
+            d
+            for sub in self._log_subdirs
+            if (d := self._agy_data_dir / sub).is_dir()
+        ]
+        if not log_dirs:
             return None
 
-        pid_pattern = re.compile(rf"\bStarting language server process with pid {pid}\b")
-        try:
-            candidates = sorted(
-                self._log_dir.glob("cli-*.log"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )[:8]
-        except OSError:
+        pid_pattern = re.compile(
+            rf"\b(?:Starting language server process with pid|Process id)\s+{pid}\b"
+        )
+        seen_paths: set[Path] = set()
+        weighted_candidates: list[tuple[float, Path]] = []
+        for log_dir in log_dirs:
+            try:
+                for path in log_dir.glob("cli-*.log"):
+                    if path in seen_paths:
+                        continue
+                    seen_paths.add(path)
+                    try:
+                        st = path.stat()
+                    except OSError:
+                        continue
+                    if st.st_size <= 0:
+                        continue
+                    weighted_candidates.append((st.st_mtime, path))
+            except OSError:
+                continue
+
+        if not weighted_candidates:
             return None
+
+        weighted_candidates.sort(key=lambda item: item[0], reverse=True)
+        candidates = [path for _, path in weighted_candidates[:16]]
 
         for cand in candidates:
             try:
                 with cand.open("rb") as fh:
-                    head = fh.read(512).decode("utf-8", errors="replace")
+                    head = fh.read(8192).decode("utf-8", errors="replace")
             except OSError:
                 continue
             if pid_pattern.search(head):
@@ -564,7 +677,7 @@ class TranscriptWatcher:
         return None
 
     def _sync_cli_log(self) -> None:
-        """Tail the child `agy` process's CLI log to bind strictly to its active conversation(s)."""
+        """Tail the child CLI process's log to bind strictly to its active conversation(s)."""
         if self._cli_log_path is None and self._child_pid is not None:
             found = self._discover_cli_log_for_pid(self._child_pid)
             if found is not None:
@@ -592,6 +705,20 @@ class TranscriptWatcher:
         self._cli_log_offset += len(complete)
 
         for line in complete.decode("utf-8", errors="replace").splitlines():
+            app_dir_match = _CLI_LOG_APP_DATA_DIR_RE.search(line)
+            if app_dir_match:
+                reported_dir = Path(app_dir_match.group(1).strip()).expanduser()
+                try:
+                    if (
+                        reported_dir.is_dir()
+                        and reported_dir.resolve() != self._agy_data_dir.resolve()
+                    ):
+                        self._agy_data_dir = reported_dir
+                        self._brain_dir = reported_dir / "brain"
+                except OSError:
+                    pass
+                continue
+
             created_match = _CLI_LOG_CREATED_CONV_RE.search(line)
             if created_match:
                 conv_id = created_match.group(1)
@@ -816,15 +943,32 @@ class TranscriptWatcher:
             and not self._allowed_conversations
         ):
             return
+
+        found_ids: list[str] = []
         content = obj.get("content")
-        if isinstance(content, str) and "conversationId" in content:
-            for match in _UUID_RE.findall(content):
-                if self._lock_to_first_conversation and not self._allowed_conversations:
-                    self._active_primary_conversation = parent_conv_id
-                    self._allowed_conversations.add(parent_conv_id)
-                self._subagent_conversations.add(match)
-                self._allowed_conversations.add(match)
-                self._excluded_conversations.discard(match)
+        if isinstance(content, str) and (
+            "conversationId" in content
+            or "conversation_id" in content
+            or "conversation://" in content
+        ):
+            found_ids.extend(_UUID_RE.findall(content))
+
+        sub_info = obj.get("subagent_info")
+        if isinstance(sub_info, (dict, list)):
+            try:
+                found_ids.extend(_UUID_RE.findall(json.dumps(sub_info)))
+            except (TypeError, ValueError):
+                pass
+
+        for match in found_ids:
+            if match == parent_conv_id or match == self._active_primary_conversation:
+                continue
+            if self._lock_to_first_conversation and not self._allowed_conversations:
+                self._active_primary_conversation = parent_conv_id
+                self._allowed_conversations.add(parent_conv_id)
+            self._subagent_conversations.add(match)
+            self._allowed_conversations.add(match)
+            self._excluded_conversations.discard(match)
 
     def _transcript_path_for(self, conv_id: str) -> Path:
         return (

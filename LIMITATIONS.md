@@ -1,12 +1,12 @@
-# Token Visualization & Billing Limitations (`agy` Harness + Google Models)
+# Token Visualization & Billing Limitations (`agy` & `jetski` Harnesses + Google Models)
 
-This document explains why **API-billed token totals** (`Billed` input, `Cache`, and `Out`) differ from the **net active tokens** (`Tokens` / `Active`) and per-category breakdowns displayed by `agy-token-viz` (`agy --visualize-tokens`) when running Google Gemini models through the Antigravity CLI (`agy`) harness.
+This document explains why **API-billed token totals** (`Billed` input, `Cache`, and `Out`) differ from the **net active tokens** (`Tokens` / `Active`) and per-category breakdowns displayed by `agy-token-viz` / `jetski-token-viz` (`--visualize-tokens`) when running Google Gemini models through the Antigravity CLI (`agy`) or Jetski CLI (`jetski`) harnesses.
 
 ---
 
 ## 1. Overview: Net Active Context vs. Cumulative API Billing
 
-An agent turn in `agy` often spans 5–50+ sequential LLM API calls (`PLANNER_RESPONSE` steps). On every step `k`, `agy` sends the entire conversation history up to that point as the prompt and logs three counters in `<AGY_DATA_DIR>/brain/<id>/.system_generated/logs/transcript.jsonl`:
+An agent turn in `agy` or `jetski` often spans 5–50+ sequential LLM API calls (`PLANNER_RESPONSE` steps). On every step `k`, the harness sends the entire conversation history up to that point as the prompt and logs three counters in `<DATA_DIR>/brain/<id>/.system_generated/logs/transcript.jsonl`:
 
 | Transcript Field | What the API Reports on Step `k` |
 | :--- | :--- |
@@ -17,7 +17,7 @@ An agent turn in `agy` often spans 5–50+ sequential LLM API calls (`PLANNER_RE
 If a visualizer simply summed `I_k + O_k` across every step, the same prompt tokens would be counted repeatedly whenever they sit in the uncached tail of the prompt. Instead, `agy-token-viz` separates **cumulative API billing** from **net active tokens**:
 
 - **Visualized `In` (`total_input_tokens`)**: Monotonic net prompt context growth across turns (`max(0, P_k - prev_end_context)`), falling back to local SentencePiece tokenization of newly appended payloads (`USER_INPUT`, `GENERIC` tool outputs, `SYSTEM_MESSAGE`, `ERROR_MESSAGE`) whenever prior thinking blocks are pruned across turn boundaries (`P_k < prev_end_context`).
-- **Step 1 `Harness Overhead` (`total_harness_overhead_tokens`)**: On Step 1 (`cache_read_tokens == 0`), `agy-token-viz` tokenizes the initial user query with the local Gemini SentencePiece tokenizer (`tokenizer.py`) and isolates the ~7,000–9,500 token `agy` system preamble (`step_1_input_tokens - user_prompt_tokens`) into `Harness Overhead`.
+- **Step 1 `Harness Overhead` (`total_harness_overhead_tokens`)**: On Step 1 (`cache_read_tokens == 0`), the visualizer tokenizes the initial user query with the local Gemini SentencePiece tokenizer (`tokenizer.py`) and isolates the ~7,000–10,500 token `agy` / `jetski` system preamble (`step_1_input_tokens - user_prompt_tokens`) into `Harness Overhead`.
 - **Summary `Billed` (`total_billed_input_tokens`)**: Raw `∑ I_k` billed by the API across all steps.
 - **Visualized `Cache` (`total_cache_read_tokens`)**: Cumulative `∑ C_k` read from prefix cache across all steps.
 - **Visualized `Out` (`total_output_tokens`) & `Think` (`total_thinking_tokens`)**: Cumulative `∑ O_k`, split into `visible_output_tokens` (computed by local SentencePiece tokenization of `content` + verbatim `tool_calls`, routed to the step's action category) and residual `thinking_tokens = max(0, output_tokens - visible_output_tokens)` (routed to `Planning`).

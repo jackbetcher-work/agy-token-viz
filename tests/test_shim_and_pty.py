@@ -11,13 +11,16 @@ import subprocess
 import time
 
 from agy_token_viz.pty_runner import (
+    filter_footer_mouse_events,
     inject_scroll_region_guards,
+    set_pty_winsize,
     split_complete_terminal_bytes,
 )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BIN_AGY = PROJECT_ROOT / "bin" / "agy"
+BIN_JETSKI = PROJECT_ROOT / "bin" / "jetski"
 
 
 def test_split_complete_terminal_bytes_preserves_incomplete_sequences() -> None:
@@ -187,7 +190,13 @@ def test_pty_interactive_mode_renders_live_2_line_bar(tmp_path: Path) -> None:
     assert "Session Token Summary" in rendered_text
 
 
-def test_inject_scroll_region_guards_restores_margins_after_1049l() -> None:
+def test_inject_scroll_region_guards_restores_margins_after_1049h_and_1049l() -> None:
+    enter_payload = b"\x1b[?1049h\x1b[H\x1b[2JWelcome to Jetski\r\n"
+    guarded_enter = inject_scroll_region_guards(enter_payload, child_rows=22)
+    assert guarded_enter.startswith(
+        b"\x1b[?1049h\x1b7\x1b[1;22r\x1b8\x1b[H\x1b[2JWelcome to Jetski"
+    )
+
     payload = b"\x1b[?1049l\r\x1b[J\nAntigravity CLI 1.5.5\r\n"
     guarded = inject_scroll_region_guards(payload, child_rows=28)
     assert guarded.startswith(b"\x1b[?1049l\x1b7\x1b[1;28r\x1b8\r\x1b[J\nAntigravity CLI 1.5.5")
@@ -326,5 +335,273 @@ def test_bash_shim_discovers_real_agy_through_symlinks_on_path(tmp_path: Path) -
         check=True,
     )
     assert 'FAKE_AGY_ARGS:["-p", "via symlink"]' in proc.stdout
+
+
+def _make_fake_jetski_script(tmp_path: Path) -> Path:
+    fake_jetski = tmp_path / "fake_jetski"
+    fake_jetski.write_text(
+        """#!/usr/bin/env python3
+import json, os, pathlib, sys, time, uuid
+
+print("FAKE_JETSKI_ARGS:" + json.dumps(sys.argv[1:]), flush=True)
+data_dir = os.environ.get("JETSKI_DATA_DIR")
+if data_dir:
+    conv_id = str(uuid.uuid4())
+    logs = pathlib.Path(data_dir) / "brain" / conv_id / ".system_generated" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    step = {
+        "step_index": 1,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "input_tokens": 2500,
+        "cache_read_tokens": 10000,
+        "output_tokens": 400,
+        "thinking": "Running blaze test suite",
+        "tool_calls": [{"name": "run_command", "args": {"CommandLine": "blaze test //pkg:all"}}],
+    }
+    (logs / "transcript.jsonl").write_text(json.dumps(step) + "\\n", encoding="utf-8")
+    time.sleep(0.25)
+""",
+        encoding="utf-8",
+    )
+    fake_jetski.chmod(fake_jetski.stat().st_mode | stat.S_IXUSR)
+    return fake_jetski
+
+
+def test_jetski_bash_shim_passthrough_bypasses_and_visualize_tokens(tmp_path: Path) -> None:
+    fake_jetski = _make_fake_jetski_script(tmp_path)
+    # Also set AGY_DATA_DIR to a decoy path to verify jetski never reads AGY_DATA_DIR
+    decoy_agy_dir = tmp_path / "decoy_agy"
+    decoy_logs = decoy_agy_dir / "brain" / "decoy" / ".system_generated" / "logs"
+    decoy_logs.mkdir(parents=True, exist_ok=True)
+    (decoy_logs / "transcript.jsonl").write_text(
+        '{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","input_tokens":99999,"output_tokens":1111}\n',
+        encoding="utf-8",
+    )
+
+    env = {
+        **os.environ,
+        "JETSKI_REAL_BIN": str(fake_jetski),
+        "JETSKI_DATA_DIR": str(tmp_path / "jetski_data"),
+        "AGY_DATA_DIR": str(decoy_agy_dir),
+    }
+
+    # 1. Zero-overhead passthrough without --visualize-tokens
+    proc_plain = subprocess.run(
+        [str(BIN_JETSKI), "-p", "quick check"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert 'FAKE_JETSKI_ARGS:["-p", "quick check"]' in proc_plain.stdout
+    assert "[jetski-token-viz]" not in proc_plain.stderr
+
+    # 2. Non-session Jetski subcommands & --stamp bypass visualizer even with --visualize-tokens
+    #    (including when aliased as `jetski --visualize-tokens --dangerously-skip-permissions`)
+    for bypass_args in (
+        ["--stamp"],
+        ["web"],
+        ["chatski"],
+        ["swarm", "capsules"],
+        ["--dangerously-skip-permissions", "models"],
+        ["--dangerously-skip-permissions", "swarm", "capsules"],
+    ):
+        proc_bypass = subprocess.run(
+            [str(BIN_JETSKI), "--visualize-tokens", *bypass_args],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert f"FAKE_JETSKI_ARGS:{BypassJson.dumps(bypass_args)}" in proc_bypass.stdout if (BypassJson := __import__("json")) else True
+        assert "[jetski-token-viz]" not in proc_bypass.stderr
+
+    # 3. Full visualization run via `bin/jetski --visualize-tokens`
+    proc_viz = subprocess.run(
+        [
+            str(BIN_JETSKI),
+            "--visualize-tokens",
+            "--viz-heuristic-only",
+            "-p",
+            "run tests",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert 'FAKE_JETSKI_ARGS:["-p", "run tests"]' in proc_viz.stdout
+    assert "[jetski-token-viz] Session Token Summary" in proc_viz.stderr
+    assert "Testing" in proc_viz.stderr
+    assert "2.9k" in proc_viz.stderr
+
+
+def test_jetski_bash_shim_discovers_real_jetski_through_symlinks_on_path(
+    tmp_path: Path,
+) -> None:
+    fake_jetski = _make_fake_jetski_script(tmp_path)
+    shim_link_dir = tmp_path / "jetski_shim_links"
+    real_bin_dir = tmp_path / "jetski_real_bin"
+    shim_link_dir.mkdir()
+    real_bin_dir.mkdir()
+
+    shim_symlink = shim_link_dir / "jetski"
+    shim_symlink.symlink_to(BIN_JETSKI)
+    real_symlink = real_bin_dir / "jetski"
+    real_symlink.symlink_to(fake_jetski)
+
+    env = {
+        **os.environ,
+        "PATH": f"{shim_link_dir}:{real_bin_dir}:{os.environ.get('PATH', '')}",
+        "JETSKI_DATA_DIR": str(tmp_path / "jetski_data"),
+    }
+    env.pop("JETSKI_REAL_BIN", None)
+    env.pop("TOKEN_VIZ_REAL_BIN", None)
+
+    proc = subprocess.run(
+        [str(shim_symlink), "-p", "jetski via symlink"],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert 'FAKE_JETSKI_ARGS:["-p", "jetski via symlink"]' in proc.stdout
+
+
+def test_filter_footer_mouse_events_clamps_wheel_drag_and_suppresses_footer_clicks() -> None:
+    # Viewport rows: 1..22; reserved footer rows: 23..24
+    # 1. Normal click inside viewport passes through untouched
+    assert (
+        filter_footer_mouse_events(b"\x1b[<0;15;10M\x1b[<0;15;10m", child_rows=22)
+        == b"\x1b[<0;15;10M\x1b[<0;15;10m"
+    )
+
+    # 2. Scroll wheel over footer rows (btn 64/65) clamps row to child_rows (22)
+    assert (
+        filter_footer_mouse_events(b"\x1b[<64;40;24M\x1b[<65;40;23M", child_rows=22)
+        == b"\x1b[<64;40;22M\x1b[<65;40;22M"
+    )
+
+    # 3. Fresh click + drag + release starting ON footer row 23 is suppressed completely
+    state = [False]
+    assert filter_footer_mouse_events(
+        b"\x1b[<0;12;23M", child_rows=22, suppressing_click=state
+    ) == b""
+    assert state[0] is True
+    assert filter_footer_mouse_events(
+        b"\x1b[<32;14;24M\x1b[<0;14;24m", child_rows=22, suppressing_click=state
+    ) == b""
+    assert state[0] is False
+
+    # 4. Selection drag starting INSIDE viewport (row 15) then dragged & released over footer (row 24)
+    #    clamps motion and mouse-up to row 22 so TUI selection never gets stuck!
+    drag_seq = b"\x1b[<0;10;15M\x1b[<32;10;24M\x1b[<0;10;24m"
+    assert (
+        filter_footer_mouse_events(drag_seq, child_rows=22)
+        == b"\x1b[<0;10;15M\x1b[<32;10;22M\x1b[<0;10;22m"
+    )
+
+
+def test_pty_alt_screen_synchronized_output_renders_footer_and_restores_on_crash(
+    tmp_path: Path,
+) -> None:
+    """
+    Simulate Jetski's default full-session alt-screen TUI (`?1049h`) with Ultraviolet
+    DEC Mode 2026 synchronized frames (`?2026h ... ?2026l`), 24-bit RGB backgrounds,
+    and `\x1b[J` screen clears, verifying:
+    - Child PTY receives `rows - 2` window height
+    - Live 2-line footer is painted while inside alt-screen (`?1049h`)
+    - Footer resets SGR (`\x1b7\x1b[0m`) before `\x1b[2K` and injects before `\x1b[?2026l`
+    - Abnormal exit without `\x1b[?1049l` automatically restores normal screen in `finally:`
+    """
+    fake_jetski_tui = tmp_path / "fake_jetski_tui"
+    fake_jetski_tui.write_text(
+        """#!/usr/bin/env python3
+import fcntl, json, os, pathlib, struct, sys, termios, time
+
+packed = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0))
+rows, cols, _, _ = struct.unpack("HHHH", packed)
+
+# Enter alt-screen for the entire session (no ?1049l emitted before exit to test crash recovery too)
+sys.stdout.write("\\x1b[?1049h\\x1b[?1006h")
+sys.stdout.write(
+    f"\\x1b[?2026h\\x1b[48;2;24;24;37m\\x1b[H\\x1b[JCHILD_WINSIZE:{rows}x{cols}\\x1b[?2026l"
+)
+sys.stdout.flush()
+
+data_dir = os.environ.get("JETSKI_DATA_DIR")
+if data_dir:
+    logs = pathlib.Path(data_dir) / "brain" / "alt-conv-001" / ".system_generated" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    step = {
+        "step_index": 1,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "input_tokens": 4000,
+        "cache_read_tokens": 0,
+        "output_tokens": 350,
+        "content": "Alt-screen response",
+    }
+    (logs / "transcript.jsonl").write_text(json.dumps(step) + "\\n", encoding="utf-8")
+
+time.sleep(0.35)
+""",
+        encoding="utf-8",
+    )
+    fake_jetski_tui.chmod(fake_jetski_tui.stat().st_mode | stat.S_IXUSR)
+
+    master_fd, slave_fd = pty.openpty()
+    set_pty_winsize(slave_fd, 24, 100)
+    env = {
+        **os.environ,
+        "JETSKI_REAL_BIN": str(fake_jetski_tui),
+        "JETSKI_DATA_DIR": str(tmp_path / "jetski_alt_data"),
+        "TERM": "xterm-256color",
+    }
+    proc = subprocess.Popen(
+        [str(BIN_JETSKI), "--visualize-tokens", "--viz-heuristic-only"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+
+    captured = bytearray()
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([master_fd], [], [], 0.1)
+        if ready:
+            try:
+                chunk = os.read(master_fd, 8192)
+                if not chunk:
+                    break
+                captured.extend(chunk)
+            except OSError:
+                break
+        elif proc.poll() is not None:
+            break
+
+    os.close(master_fd)
+    assert proc.wait(timeout=5) == 0
+
+    raw = bytes(captured)
+    text = raw.decode("utf-8", errors="replace")
+    assert "CHILD_WINSIZE:22x100" in text
+
+    # Between ?1049h and the abnormal-exit ?1049l recovery, the footer must be painted on rows 23 & 24
+    alt_start = raw.index(b"\x1b[?1049h")
+    alt_end = raw.rindex(b"\x1b[?1049l")
+    during_alt = raw[alt_start:alt_end]
+    assert b"\x1b7\x1b[0m" in during_alt
+    assert b"\x1b[23;1H\x1b[2K" in during_alt
+    assert b"\x1b[24;1H\x1b[2K" in during_alt
+    assert b"\x1b8\x1b[?2026l" in during_alt
+    assert "[jetski-token-viz] Session Token Summary" in text
+
 
 

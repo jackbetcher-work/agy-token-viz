@@ -79,6 +79,7 @@ def build_category_grammar_string(categories: Sequence[str]) -> str:
 _READ_SEARCH_TOOLS = frozenset(
     {
         "read_file",
+        "read_board",
         "search_web",
         "grep_search",
         "find_by_name",
@@ -99,7 +100,16 @@ _CODE_WRITE_TOOLS = frozenset(
         "multi_replace_file_content",
     }
 )
-_TASK_CMD_TOOLS = frozenset({"manage_task", "send_command_input", "command_status"})
+_TASK_CMD_TOOLS = frozenset(
+    {
+        "manage_task",
+        "manage_subagents",
+        "schedule",
+        "swarm_wait",
+        "send_command_input",
+        "command_status",
+    }
+)
 _COMM_TOOLS = frozenset({"ask_question", "notify_user"})
 
 _TEST_EXECUTABLES = frozenset(
@@ -129,6 +139,7 @@ _TEST_EXECUTABLES = frozenset(
         "rspec",
         "phpunit",
         "ctest",
+        "tricorder",
     }
 )
 
@@ -148,6 +159,7 @@ _READONLY_EXECUTABLES = frozenset(
         "fgrep",
         "ag",
         "ack",
+        "cs",
         "cat",
         "head",
         "tail",
@@ -201,6 +213,63 @@ _GIT_READONLY_SUBCOMMANDS = frozenset(
         "blame",
         "shortlog",
         "describe",
+    }
+)
+
+_P4_READONLY_SUBCOMMANDS = frozenset(
+    {
+        "status",
+        "diff",
+        "diff2",
+        "describe",
+        "changes",
+        "opened",
+        "files",
+        "fstat",
+        "print",
+        "annotate",
+        "blame",
+        "grep",
+        "info",
+        "where",
+        "clients",
+        "have",
+        "help",
+        "pending",
+    }
+)
+
+_HG_READONLY_SUBCOMMANDS = frozenset(
+    {
+        "status",
+        "st",
+        "log",
+        "history",
+        "diff",
+        "ll",
+        "xl",
+        "sl",
+        "smartlog",
+        "show",
+        "cat",
+        "files",
+        "manifest",
+        "locate",
+        "grep",
+        "annotate",
+        "blame",
+        "id",
+        "identify",
+        "root",
+        "paths",
+        "branches",
+        "heads",
+        "parents",
+        "summary",
+        "sum",
+        "config",
+        "help",
+        "version",
     }
 )
 
@@ -373,6 +442,15 @@ def _segment_domain(segment: str) -> str | None:
             return "testing"
         return "commands"
 
+    if exe in ("blaze", "bazel", "bazelisk"):
+        sub = [a for a in args_low if not a.startswith("-")]
+        if sub:
+            if sub[0] in ("test", "coverage"):
+                return "testing"
+            if sub[0] in ("query", "cquery", "aquery", "info", "version", "help"):
+                return "commands" if _has_unquoted_file_redirect(segment) else "exploration"
+        return "commands"
+
     # 2. Mutating output redirection turns otherwise read-only tools into `commands`
     if _has_unquoted_file_redirect(segment):
         return "commands"
@@ -413,6 +491,50 @@ def _segment_domain(segment: str) -> str | None:
             return "exploration"
         return "commands"
 
+    if exe in ("g4", "p4"):
+        idx = 0
+        while idx < len(args_low):
+            tok = args_low[idx]
+            if tok in ("-c", "-d", "-u", "-p", "-h") and idx + 1 < len(args_low):
+                idx += 2
+                continue
+            if tok.startswith("-"):
+                idx += 1
+                continue
+            break
+        if idx >= len(args_low):
+            return "exploration"
+        subcmd = args_low[idx]
+        rest = args_low[idx + 1 :]
+        if subcmd in _P4_READONLY_SUBCOMMANDS:
+            return "exploration"
+        if subcmd == "client" and "-o" in rest and "-i" not in rest:
+            return "exploration"
+        return "commands"
+
+    if exe == "hg":
+        idx = 0
+        while idx < len(args_low):
+            tok = args_low[idx]
+            if tok in ("-r", "--repository", "--cwd", "--config") and idx + 1 < len(args_low):
+                idx += 2
+                continue
+            if tok.startswith("-"):
+                idx += 1
+                continue
+            break
+        if idx >= len(args_low):
+            return "exploration"
+        subcmd = args_low[idx]
+        rest = args_low[idx + 1 :]
+        if subcmd in _HG_READONLY_SUBCOMMANDS:
+            return "exploration"
+        if subcmd in ("bookmark", "bookmarks", "tag", "tags") and (
+            not rest or rest[0] in ("-l", "--list")
+        ):
+            return "exploration"
+        return "commands"
+
     return "commands"
 
 
@@ -441,7 +563,7 @@ def classify_shell_command(command_line: str) -> str:
 def _classify_tool_domain(tc: ToolCallSummary) -> str | None:
     """Map a single tool invocation to a semantic domain, or `None` if context-dependent."""
     t_low = tc.name.lower()
-    summary_low = tc.summary.lower()
+    summary_low = tc.summary.lower().strip()
 
     if t_low in _READ_SEARCH_TOOLS:
         return "exploration"
@@ -451,6 +573,15 @@ def _classify_tool_domain(tc: ToolCallSummary) -> str | None:
         return "coding"
     if t_low == "run_command":
         return classify_shell_command(tc.summary)
+    if t_low == "swarm":
+        first_word = summary_low.split(" ", 1)[0] if summary_low else ""
+        if first_word in ("status", "models"):
+            return "exploration"
+        if first_word in ("kill", "model", "title"):
+            return "commands"
+        return None
+    if t_low in ("send_message", "post_message"):
+        return "commands"
     if t_low in _TASK_CMD_TOOLS:
         return "commands"
     if t_low in _COMM_TOOLS:
@@ -636,25 +767,41 @@ def heuristic_classify(
     """Deterministic classifier used when heuristic-only mode is enabled or LLM inference is unavailable."""
     cats = list(categories) if categories else list(DEFAULT_CATEGORIES)
 
-    direct, candidates = resolve_tool_guardrail(step, cats)
+    direct, _candidates = resolve_tool_guardrail(step, cats)
     if direct is not None:
         return direct
 
-    # Mixed-tool turn: prioritize Coding > Testing > Commands > Exploration > Planning > Communication
-    if step.tool_calls and candidates:
-        for preferred_dom in ("coding", "testing", "commands", "exploration", "planning", "communication"):
-            matched = _match_domain_to_category(preferred_dom, candidates)
-            if matched is not None:
-                return matched
-        return candidates[0]
-
-    # Subagent / custom tool calls
+    # Mixed-tool or orchestration/custom tool turns: gather domains actually present on this step
     if step.tool_calls:
-        tool_names = [tc.name.lower() for tc in step.tool_calls]
-        if any(t == "invoke_subagent" for t in tool_names):
-            return _match_domain_to_category("exploration", cats) or cats[0]
+        step_domains: list[str] = []
+        for tc in step.tool_calls:
+            dom = _classify_tool_domain(tc)
+            if dom is None:
+                t_low = tc.name.lower()
+                if t_low == "define_subagent":
+                    dom = "planning"
+                elif t_low in ("run_workflow", "swarm", "send_message", "post_message"):
+                    dom = "commands"
+                elif t_low == "invoke_subagent":
+                    dom = "exploration"
+            if dom is not None and dom not in step_domains:
+                step_domains.append(dom)
 
-    # No-tool turn with user-facing message: Communication unless explicitly proposing a plan
+        if step_domains:
+            for preferred_dom in (
+                "coding",
+                "testing",
+                "commands",
+                "exploration",
+                "planning",
+                "communication",
+            ):
+                if preferred_dom in step_domains:
+                    matched = _match_domain_to_category(preferred_dom, cats)
+                    if matched is not None:
+                        return matched
+
+    # No-tool (or unrecognized MCP tool) turn with user-facing message
     if step.content.strip():
         if _PROPOSED_PLAN_RE.search(step.content):
             return _match_domain_to_category("planning", cats) or cats[0]

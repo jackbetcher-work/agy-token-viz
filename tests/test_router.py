@@ -7,7 +7,14 @@ from typing import Any
 
 from llama_cpp import LlamaGrammar
 
-from agy_token_viz.config import ModelSpec, get_hf_token, resolve_model_spec
+from agy_token_viz.config import (
+    ModelSpec,
+    VizConfig,
+    get_hf_token,
+    resolve_harness_profile,
+    resolve_model_spec,
+)
+from agy_token_viz.renderer import render_final_summary
 from agy_token_viz.router import (
     AsyncStepClassifier,
     OpenModelRouter,
@@ -375,5 +382,134 @@ def test_async_step_classifier_skips_model_load_for_deterministic_guardrail_step
     # Because all 4 steps resolved via deterministic tool guardrails, GGUF load was never triggered
     assert load_calls == []
     assert router.is_loaded is False
+
+
+def test_classify_shell_command_supports_jetski_blaze_g4_hg_cs_tricorder() -> None:
+    # Blaze / Bazel / Tricorder
+    assert classify_shell_command("blaze test //foo/bar:all") == "testing"
+    assert classify_shell_command("bazel --batch coverage //foo/...") == "testing"
+    assert classify_shell_command("tricorder analyze //foo/...") == "testing"
+    assert classify_shell_command("blaze build //foo/bar:bin") == "commands"
+    assert classify_shell_command("blaze run //foo/bar:bin -- --flag") == "commands"
+    assert classify_shell_command("blaze query 'deps(//foo:bar)'") == "exploration"
+    assert classify_shell_command("bazel cquery //foo:bar > /tmp/out.txt") == "commands"
+
+    # CitC / Perforce (g4 / p4) & Code Search (cs)
+    assert classify_shell_command("g4 status && g4 diff") == "exploration"
+    assert classify_shell_command("p4 -c my_client opened") == "exploration"
+    assert classify_shell_command("g4 client -o") == "exploration"
+    assert classify_shell_command("g4 client -i") == "commands"
+    assert classify_shell_command("g4 sync") == "commands"
+    assert classify_shell_command("p4 edit foo.cc") == "commands"
+    assert classify_shell_command("cs ' TranscriptWatcher '") == "exploration"
+
+    # Mercurial / Fig (hg)
+    assert classify_shell_command("hg status && hg xl") == "exploration"
+    assert classify_shell_command("hg diff -r .^") == "exploration"
+    assert classify_shell_command("hg bookmark -l") == "exploration"
+    assert classify_shell_command("hg bookmark my-feature") == "commands"
+    assert classify_shell_command("hg commit -m 'update'") == "commands"
+    assert classify_shell_command("hg upload") == "commands"
+
+
+def test_jetski_orchestration_tools_guardrails_and_heuristics() -> None:
+    # Read-only swarm / board inspection -> deterministic Exploration
+    board_step = StepRecord(
+        "c-j", 1, 500, 0, 80, tool_calls=(ToolCallSummary("read_board", ""),)
+    )
+    assert resolve_tool_guardrail(board_step)[0] == "Exploration"
+
+    swarm_status_step = StepRecord(
+        "c-j", 2, 500, 0, 80, tool_calls=(ToolCallSummary("swarm", "status"),)
+    )
+    assert resolve_tool_guardrail(swarm_status_step)[0] == "Exploration"
+
+    # Agent-to-agent messaging & subagent/swarm management -> deterministic Commands (never Communication)
+    for tc in (
+        ToolCallSummary("send_message", "conv-worker-1"),
+        ToolCallSummary("manage_subagents", "list"),
+        ToolCallSummary("schedule", "check build"),
+        ToolCallSummary("swarm_wait", ""),
+        ToolCallSummary("swarm", "kill worker-1"),
+    ):
+        step = StepRecord("c-j", 3, 500, 0, 80, tool_calls=(tc,))
+        assert resolve_tool_guardrail(step)[0] == "Commands"
+
+    # Context-dependent orchestration tools in heuristic mode
+    assert (
+        heuristic_classify(
+            StepRecord(
+                "c-j",
+                4,
+                500,
+                0,
+                120,
+                tool_calls=(ToolCallSummary("define_subagent", "verifier"),),
+            )
+        )
+        == "Planning"
+    )
+    assert (
+        heuristic_classify(
+            StepRecord(
+                "c-j",
+                5,
+                500,
+                0,
+                120,
+                tool_calls=(ToolCallSummary("run_workflow", "fanout.py"),),
+            )
+        )
+        == "Commands"
+    )
+    assert (
+        heuristic_classify(
+            StepRecord(
+                "c-j",
+                6,
+                500,
+                0,
+                120,
+                tool_calls=(ToolCallSummary("swarm", "add worker"),),
+            )
+        )
+        == "Commands"
+    )
+
+
+def test_harness_profiles_and_viz_config_separate_agy_and_jetski(tmp_path: Path) -> None:
+    assert resolve_harness_profile(prog_name="jetski-token-viz").name == "jetski"
+    assert resolve_harness_profile(prog_name="agy-token-viz").name == "agy"
+
+    # Jetski config must ignore AGY_DATA_DIR and use JETSKI_DATA_DIR / --app_data_dir
+    cfg_env = VizConfig.from_env_and_args(
+        target="jetski",
+        env={
+            "AGY_DATA_DIR": str(tmp_path / "wrong_agy"),
+            "JETSKI_DATA_DIR": str(tmp_path / "right_jetski"),
+            "AGY_VIZ_HEURISTIC_ONLY": "1",
+        },
+    )
+    assert cfg_env.target == "jetski"
+    assert cfg_env.data_dir == tmp_path / "right_jetski"
+    assert cfg_env.offline_heuristic_only is True
+    assert cfg_env.profile.log_subdirs == ("cli/log", "log")
+    assert cfg_env.profile.tag == "jetski-token-viz"
+
+    # Forwarded `--gemini_dir` / `--app_data_dir` overrides env fallback
+    cfg_cli = VizConfig.from_env_and_args(
+        target="jetski",
+        cli_args=["--gemini_dir", str(tmp_path / "custom_gem"), "--app_data_dir", "my_jetski"],
+        env={"JETSKI_DATA_DIR": str(tmp_path / "env_jetski")},
+    )
+    assert cfg_cli.data_dir == tmp_path / "custom_gem" / "my_jetski"
+
+    # Exit summary uses harness-specific label
+    state = SessionTokenState()
+    empty_summary = render_final_summary(
+        state.snapshot(), use_color=False, label=cfg_env.profile.tag
+    )
+    assert "[jetski-token-viz]" in empty_summary
+
 
 

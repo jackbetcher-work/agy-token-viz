@@ -262,10 +262,11 @@ def render_single_status_line(
 def render_final_summary(
     snapshot: LedgerSnapshot,
     use_color: bool = True,
+    label: str = "agy-token-viz",
 ) -> str:
     """Render a concise post-session token breakdown by activity category."""
     if snapshot.total_steps == 0:
-        header = "[agy-token-viz] No agent steps recorded in this session."
+        header = f"[{label}] No agent steps recorded in this session."
         return f"{DIM}{header}{RESET}" if use_color else header
 
     lines: list[str] = []
@@ -278,7 +279,7 @@ def render_final_summary(
         out_summary += f" (Think: {format_token_count(snapshot.total_thinking_tokens)})"
 
     title = (
-        f"[agy-token-viz] Session Token Summary "
+        f"[{label}] Session Token Summary "
         f"(Active: {format_token_count(snapshot.total_active_tokens)} | "
         f"{in_summary} | "
         f"Cache: {format_token_count(snapshot.total_cache_read_tokens)} | "

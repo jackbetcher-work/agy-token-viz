@@ -1,4 +1,4 @@
-"""PTY terminal wrapper reserving a 2-line bottom status bar while running `agy` cleanly."""
+"""PTY terminal wrapper reserving a 2-line bottom status bar while running `agy` or `jetski` cleanly."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from agy_token_viz.state import SessionTokenState
 
 BAR_ROWS = 2
 MIN_TERMINAL_ROWS_FOR_FOOTER = 6
+SYNC_UPDATE_TIMEOUT_SEC = 0.25
 
 # Detect child sequences that reset scroll margins or clear/switch screen buffers
 _REGION_OR_CLEAR_RE = re.compile(
@@ -36,21 +37,80 @@ _REGION_OR_CLEAR_RE = re.compile(
 # Track alternate screen buffer entry ('h') and exit ('l')
 _ALT_BUFFER_RE = re.compile(rb"\x1b\[\?(?:1049|1047|47)([hl])")
 
-# Child sequences that exit the alternate screen buffer or reset DECSTBM scroll margins
-_MARGIN_RESTORE_RE = re.compile(rb"\x1b\[(?:\?(?:1049|1047|47)l|[0-9;]*r)")
+# Track DEC Mode 2026 synchronized output begin ('h') and end ('l')
+_SYNC_UPDATE_RE = re.compile(rb"\x1b\[\?2026([hl])")
+
+# Child sequences that enter/exit the alternate screen buffer or reset DECSTBM scroll margins
+_MARGIN_RESTORE_RE = re.compile(rb"\x1b\[(?:\?(?:1049|1047|47)[hl]|[0-9;]*r)")
+
+# SGR mouse events (`\x1b[<btn;col;rowM` or `\x1b[<btn;col;rowm`)
+_SGR_MOUSE_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 
 
 def inject_scroll_region_guards(data: bytes, child_rows: int) -> bytes:
     """
     Immediately re-apply `DECSTBM` (`\\x1b7\\x1b[1;{child_rows}r\\x1b8`) right after any
-    sequence in `data` that exits the alternate screen buffer (`\\x1b[?1049l`) or resets
-    scroll margins (`\\x1b[...r`), before subsequent newlines in the same chunk can scroll
-    into the reserved bottom footer rows.
+    sequence in `data` that switches alternate/normal screen buffers (`\\x1b[?1049h/l`) or
+    resets scroll margins (`\\x1b[...r`), before subsequent newlines or scrolls in the same
+    chunk can overwrite the reserved bottom footer rows.
     """
     if not data or not _MARGIN_RESTORE_RE.search(data):
         return data
     guard = f"\x1b7\x1b[1;{max(1, child_rows)}r\x1b8".encode("ascii")
     return _MARGIN_RESTORE_RE.sub(lambda m: m.group(0) + guard, data)
+
+
+def filter_footer_mouse_events(
+    data: bytes,
+    child_rows: int,
+    *,
+    suppressing_click: list[bool] | None = None,
+) -> bytes:
+    """
+    Filter or clamp SGR mouse events (`\\x1b[<btn;col;rowM/m`) targeting the reserved
+    2-line bottom footer (`row > child_rows`) so clicks on the status bar never trigger
+    TUI controls while wheel scrolling and active drag-releases stay smooth.
+    """
+    if not data or b"\x1b[<" not in data:
+        return data
+
+    max_row = max(1, child_rows)
+    state = suppressing_click if suppressing_click is not None else [False]
+
+    def _replace(match: re.Match[bytes]) -> bytes:
+        btn = int(match.group(1))
+        col = int(match.group(2))
+        row = int(match.group(3))
+        final = match.group(4)
+
+        is_wheel = (btn & 64) != 0
+        is_motion = (btn & 32) != 0
+
+        if row <= max_row:
+            if final == b"M" and not is_wheel and not is_motion:
+                state[0] = False
+            elif final == b"m":
+                state[0] = False
+            return match.group(0)
+
+        if is_wheel:
+            return f"\x1b[<{btn};{col};{max_row}".encode("ascii") + final
+
+        if is_motion:
+            if state[0]:
+                return b""
+            return f"\x1b[<{btn};{col};{max_row}".encode("ascii") + final
+
+        if final == b"M":
+            state[0] = True
+            return b""
+
+        if state[0]:
+            state[0] = False
+            return b""
+        return f"\x1b[<{btn};{col};{max_row}m".encode("ascii")
+
+    return _SGR_MOUSE_RE.sub(_replace, data)
 
 
 def get_terminal_size(fd: int) -> tuple[int, int]:
@@ -257,9 +317,11 @@ class PTYVisualizerRunner:
         snap = self._state.snapshot()
         line1, line2 = render_status_lines(snap, cols=cols, use_color=self._use_color)
 
-        # IMPORTANT: Save child cursor (\x1b7) BEFORE DECSTBM (\x1b[1;{child_rows}r),
-        # because DECSTBM homes the cursor to (1, 1) per VT100/xterm specification.
-        parts: list[str] = ["\x1b7"]
+        # IMPORTANT: Save child cursor & SGR state (\x1b7) BEFORE resetting SGR (\x1b[0m)
+        # and DECSTBM (\x1b[1;{child_rows}r). Resetting SGR before `\x1b[2K` prevents active
+        # 24-bit RGB background colors in alt-screen TUIs from bleeding via Background Color
+        # Erase (BCE); `\x1b8` restores the child's saved cursor position and SGR attributes.
+        parts: list[str] = ["\x1b7\x1b[0m"]
         if reapply_scroll_region:
             parts.append(f"\x1b[1;{child_rows}r")
         parts.append(f"\x1b[{rows - 1};1H\x1b[2K{line1}")
@@ -347,18 +409,42 @@ class PTYVisualizerRunner:
 
         pending_child_bytes = b""
         last_bar_paint = time.monotonic()
+        in_sync_update = False
+        sync_started_at = 0.0
+        pending_region_restore = False
+        suppressing_footer_click = [False]
+
+        def _track_terminal_modes(raw: bytes, now_ts: float) -> None:
+            nonlocal in_alt_screen, in_sync_update, sync_started_at
+            for alt_m in _ALT_BUFFER_RE.finditer(raw):
+                in_alt_screen = alt_m.group(1) == b"h"
+            for sync_m in _SYNC_UPDATE_RE.finditer(raw):
+                if sync_m.group(1) == b"h":
+                    in_sync_update = True
+                    sync_started_at = now_ts
+                else:
+                    in_sync_update = False
 
         try:
             tty.setraw(stdin_fd)
 
             while True:
-                timeout = 0.05 if state_dirty[0] else 0.25
+                timeout = (
+                    0.05
+                    if (state_dirty[0] or pending_region_restore or in_sync_update)
+                    else 0.25
+                )
                 try:
                     rlist, _, _ = select.select(
                         [master_fd, stdin_fd, wakeup_r], [], [], timeout
                     )
                 except InterruptedError:
                     rlist = []
+
+                if in_sync_update and (
+                    time.monotonic() - sync_started_at
+                ) >= SYNC_UPDATE_TIMEOUT_SEC:
+                    in_sync_update = False
 
                 if wakeup_r in rlist:
                     try:
@@ -372,7 +458,7 @@ class PTYVisualizerRunner:
                     use_footer = rows >= MIN_TERMINAL_ROWS_FOR_FOOTER
                     child_rows = max(1, rows - BAR_ROWS) if use_footer else rows
                     set_pty_winsize(master_fd, child_rows, cols)
-                    if use_footer and not in_alt_screen:
+                    if use_footer and not in_sync_update:
                         _write_all(
                             tty_out_fd,
                             self._build_footer_sequence(
@@ -381,6 +467,9 @@ class PTYVisualizerRunner:
                         )
                         last_bar_paint = time.monotonic()
                         state_dirty[0] = False
+                        pending_region_restore = False
+                    elif use_footer:
+                        pending_region_restore = True
 
                 if stdin_fd in rlist:
                     try:
@@ -388,7 +477,14 @@ class PTYVisualizerRunner:
                     except OSError:
                         user_bytes = b""
                     if user_bytes:
-                        _write_all(master_fd, user_bytes)
+                        if use_footer:
+                            user_bytes = filter_footer_mouse_events(
+                                user_bytes,
+                                child_rows,
+                                suppressing_click=suppressing_footer_click,
+                            )
+                        if user_bytes:
+                            _write_all(master_fd, user_bytes)
 
                 if master_fd in rlist:
                     try:
@@ -401,6 +497,7 @@ class PTYVisualizerRunner:
                     if not chunk:
                         # Child closed PTY slave
                         if pending_child_bytes:
+                            _track_terminal_modes(pending_child_bytes, time.monotonic())
                             _write_all(tty_out_fd, pending_child_bytes)
                             pending_child_bytes = b""
                         break
@@ -423,12 +520,17 @@ class PTYVisualizerRunner:
                     complete, pending_child_bytes = split_complete_terminal_bytes(combined)
                     if complete:
                         if use_footer:
-                            for match in _ALT_BUFFER_RE.finditer(complete):
-                                in_alt_screen = match.group(1) == b"h"
+                            now = time.monotonic()
+                            _track_terminal_modes(complete, now)
                             guarded = inject_scroll_region_guards(complete, child_rows)
-                            if not in_alt_screen:
-                                needs_region = bool(_REGION_OR_CLEAR_RE.search(complete))
-                                now = time.monotonic()
+                            chunk_needs_region = bool(_REGION_OR_CLEAR_RE.search(complete))
+
+                            if in_sync_update:
+                                if chunk_needs_region:
+                                    pending_region_restore = True
+                                _write_all(tty_out_fd, guarded)
+                            else:
+                                needs_region = chunk_needs_region or pending_region_restore
                                 if needs_region or (
                                     state_dirty[0]
                                     and (now - last_bar_paint) >= self._min_refresh_interval
@@ -438,13 +540,16 @@ class PTYVisualizerRunner:
                                         cols,
                                         reapply_scroll_region=needs_region,
                                     )
-                                    _write_all(tty_out_fd, guarded + footer)
+                                    if guarded.endswith(b"\x1b[?2026l"):
+                                        out_payload = guarded[:-8] + footer + b"\x1b[?2026l"
+                                    else:
+                                        out_payload = guarded + footer
+                                    _write_all(tty_out_fd, out_payload)
                                     last_bar_paint = now
                                     state_dirty[0] = False
+                                    pending_region_restore = False
                                 else:
                                     _write_all(tty_out_fd, guarded)
-                            else:
-                                _write_all(tty_out_fd, guarded)
                         else:
                             _write_all(tty_out_fd, complete)
 
@@ -452,19 +557,23 @@ class PTYVisualizerRunner:
                 now = time.monotonic()
                 if (
                     use_footer
-                    and not in_alt_screen
-                    and state_dirty[0]
+                    and not in_sync_update
+                    and (state_dirty[0] or pending_region_restore)
                     and not pending_child_bytes
-                    and (now - last_bar_paint) >= self._min_refresh_interval
+                    and (
+                        pending_region_restore
+                        or (now - last_bar_paint) >= self._min_refresh_interval
+                    )
                 ):
                     _write_all(
                         tty_out_fd,
                         self._build_footer_sequence(
-                            rows, cols, reapply_scroll_region=False
+                            rows, cols, reapply_scroll_region=pending_region_restore
                         ),
                     )
                     last_bar_paint = now
                     state_dirty[0] = False
+                    pending_region_restore = False
 
                 if proc.poll() is not None and master_fd not in rlist:
                     # Drain any remaining bytes on master_fd before exiting loop
@@ -476,6 +585,7 @@ class PTYVisualizerRunner:
                             tail = os.read(master_fd, 16384)
                             if not tail:
                                 break
+                            _track_terminal_modes(tail, time.monotonic())
                             _write_all(tty_out_fd, tail)
                         except OSError:
                             break
@@ -489,11 +599,19 @@ class PTYVisualizerRunner:
             except termios.error:
                 pass
 
+            if in_sync_update:
+                _write_all(tty_out_fd, b"\x1b[?2026l")
+            if in_alt_screen:
+                _write_all(
+                    tty_out_fd,
+                    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[?1049l",
+                )
+
             if use_footer:
                 rows, _ = get_terminal_size(tty_out_fd)
                 # Clear the 2 pinned footer lines, reset DECSTBM margins, place cursor cleanly
                 cleanup_seq = (
-                    "\x1b7"
+                    "\x1b7\x1b[0m"
                     f"\x1b[{max(1, rows - 1)};1H\x1b[2K"
                     f"\x1b[{max(1, rows)};1H\x1b[2K"
                     "\x1b[r"

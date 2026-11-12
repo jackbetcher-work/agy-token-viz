@@ -40,9 +40,11 @@ jobs:
         run: |
           .venv/bin/pytest -v
 
-      - name: Verify CLI entrypoint
+      - name: Verify CLI entrypoints
         run: |
           .venv/bin/agy-token-viz --help
+          .venv/bin/jetski-token-viz --help
+          .venv/bin/token-viz --help
 
   build:
     name: Build Package & Bundle

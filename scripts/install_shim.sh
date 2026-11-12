@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Helper to wire `token_usage_viz/bin` ahead of `agy` on PATH so `agy --visualize-tokens` works everywhere.
+# Helper to wire `token_usage_viz/bin` ahead of `agy` and `jetski` on PATH so `--visualize-tokens` works everywhere.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -23,8 +23,9 @@ while [[ $# -gt 0 ]]; do
       cat <<EOF
 Usage: $(basename "$0") [--dry-run] [--rc-file ~/.zshrc]
 
-Configures your shell so \`agy --visualize-tokens\` invokes the token visualizer shim
-while normal \`agy\` commands pass straight through to the underlying binary.
+Configures your shell so \`agy --visualize-tokens\` and \`jetski --visualize-tokens\`
+invoke the token visualizer shims while normal \`agy\` and \`jetski\` commands pass
+straight through to the underlying binaries.
 EOF
       exit 0
       ;;
@@ -57,3 +58,4 @@ else
 fi
 echo "[agy-token-viz] Run 'source $RC_FILE' (or open a new terminal), then try:"
 echo "  agy --visualize-tokens"
+echo "  jetski --visualize-tokens"

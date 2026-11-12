@@ -9,6 +9,7 @@ from agy_token_viz.state import Category, SessionTokenState, StepRecord
 from agy_token_viz.tokenizer import count_tokens_locally, serialize_tool_calls_verbatim
 from agy_token_viz.transcript_watcher import (
     TranscriptWatcher,
+    extract_data_dir_from_args,
     extract_log_file_from_args,
     extract_target_conversation_from_args,
     is_resuming_conversation_from_args,
@@ -618,4 +619,205 @@ def test_fresh_session_skips_preexisting_inspection_and_globbing_once_bound(
     assert watcher.poll_once() == 1
     assert iter_calls == []
     assert len(seen) == 2
+
+
+def test_jetski_cli_flags_and_data_dir_extraction(tmp_path: Path) -> None:
+    conv_uuid = "12c9f024-1dd7-4b1a-8cd9-b2f92a4d4f7e"
+    assert (
+        extract_target_conversation_from_args(
+            ["--conversation_path", f"/tmp/jetski/conversations/{conv_uuid}.pb"]
+        )
+        == conv_uuid
+    )
+    assert (
+        extract_target_conversation_from_args(
+            [f"-conversation_path=/tmp/jetski/conversations/{conv_uuid}.pb"]
+        )
+        == conv_uuid
+    )
+    assert is_resuming_conversation_from_args(["--conversation_path", "/tmp/c.pb"]) is True
+    assert is_resuming_conversation_from_args(["-conversation_path=/tmp/c.pb"]) is True
+    assert extract_log_file_from_args(["--cli_log_file", "/tmp/jetski.log"]) == Path(
+        "/tmp/jetski.log"
+    )
+    assert extract_log_file_from_args(["-cli_log_file=/tmp/jetski2.log"]) == Path(
+        "/tmp/jetski2.log"
+    )
+
+    assert extract_data_dir_from_args(["-p", "hello"], default_app_data_name="jetski") is None
+    assert extract_data_dir_from_args(
+        ["--gemini_dir", str(tmp_path / "gem")],
+        default_app_data_name="jetski",
+    ) == (tmp_path / "gem" / "jetski")
+    assert extract_data_dir_from_args(
+        [f"--gemini_dir={tmp_path / 'gem'}", "--app_data_dir=custom_app"],
+        default_app_data_name="jetski",
+    ) == (tmp_path / "gem" / "custom_app")
+    assert extract_data_dir_from_args(
+        ["--app_data_dir", str(tmp_path / "abs_jetski")],
+        default_app_data_name="jetski",
+    ) == (tmp_path / "abs_jetski")
+
+
+def test_jetski_cli_log_discovery_with_large_build_stamp_and_isolated_dir(
+    tmp_path: Path,
+) -> None:
+    """
+    Verify Jetski's `<data_dir>/cli/log/cli-*.log` directory layout, `Process id <pid>`
+    line-1 header, >2 KB build-stamp header offset before `Starting language server process`,
+    and dynamic `CLI app data directory:` relocation (used by `--isolated_env`).
+    """
+    jetski_dir = tmp_path / "jetski_default"
+    isolated_dir = tmp_path / "jetski_isolated"
+    cli_log_dir = jetski_dir / "cli" / "log"
+    cli_log_dir.mkdir(parents=True, exist_ok=True)
+    isolated_dir.mkdir(parents=True, exist_ok=True)
+
+    build_stamp_padding = "".join(
+        f"I1112 11:43:05.000000 1 stamp.go:{i}] build_metadata_entry_{i}={'x' * 70}\n"
+        for i in range(35)
+    )
+    assert len(build_stamp_padding) > 2500
+
+    cli_log = cli_log_dir / "cli-20261112_114305.log"
+    cli_log.write_text(
+        "I1112 11:43:05.000000 1 log_spam.go:42] Process id 77889\n"
+        + build_stamp_padding
+        + f"I1112 11:43:07.000000 1 common.go:212] CLI app data directory: {isolated_dir}\n"
+        + "I1112 11:43:08.000000 1 server.go:2341] Starting language server process with pid 77889\n",
+        encoding="utf-8",
+    )
+
+    seen: list[StepRecord] = []
+    watcher = TranscriptWatcher(
+        data_dir=jetski_dir,
+        log_subdirs=("cli/log", "log"),
+        on_step=seen.append,
+        exclude_preexisting=True,
+        lock_to_first_conversation=True,
+    )
+    watcher.capture_baseline()
+    watcher.set_child_pid(77889)
+
+    conv_id = "22222222-3333-4444-5555-666666666666"
+    with cli_log.open("a", encoding="utf-8") as fh:
+        fh.write(f"I1112 11:43:10.000000 99 server.go:1233] Created conversation {conv_id}\n")
+
+    isolated_logs = _make_logs_dir(isolated_dir, conv_id)
+    (isolated_logs / "transcript.jsonl").write_text(
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "input_tokens": 10400,
+                "cache_read_tokens": 0,
+                "output_tokens": 220,
+                "tool_calls": [
+                    {
+                        "name": "swarm",
+                        "args": {"action": "add", "name": "verifier", "brief": "Run tests"},
+                    }
+                ],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert watcher.poll_once() == 1
+    assert len(seen) == 1
+    assert seen[0].conversation_id == conv_id
+    assert seen[0].tool_calls[0].name == "swarm"
+    assert seen[0].tool_calls[0].summary == "add verifier"
+
+
+def test_discover_subagents_supports_jetski_swarm_and_subagent_formats(
+    tmp_path: Path,
+) -> None:
+    parent_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    worker1_id = "11111111-aaaa-bbbb-cccc-111111111111"
+    worker2_id = "22222222-aaaa-bbbb-cccc-222222222222"
+
+    parent_logs = _make_logs_dir(tmp_path, parent_id)
+    worker1_logs = _make_logs_dir(tmp_path, worker1_id)
+    worker2_logs = _make_logs_dir(tmp_path, worker2_id)
+
+    seen: list[StepRecord] = []
+    watcher = TranscriptWatcher(
+        data_dir=tmp_path,
+        on_step=seen.append,
+        target_conversation_id=parent_id,
+        exclude_preexisting=True,
+        lock_to_first_conversation=True,
+    )
+    watcher.capture_baseline()
+
+    # Parent emits a GENERIC tool result with conversation:// link + subagent_info dict
+    (parent_logs / "transcript.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "step_index": 1,
+                        "type": "GENERIC",
+                        "status": "DONE",
+                        "content": (
+                            f"Parent conversation://{parent_id} spawned "
+                            f"worker [verifier](conversation://{worker1_id})"
+                        ),
+                        "subagent_info": {"conversation_id": worker2_id},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "step_index": 2,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "input_tokens": 5000,
+                        "output_tokens": 100,
+                        "content": "Waiting for workers.",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (worker1_logs / "transcript.jsonl").write_text(
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "input_tokens": 3000,
+                "output_tokens": 150,
+                "content": "Worker 1 done.",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (worker2_logs / "transcript.jsonl").write_text(
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "input_tokens": 3200,
+                "output_tokens": 180,
+                "content": "Worker 2 done.",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # First poll reads parent transcript & discovers worker1 + worker2; second poll drains workers
+    watcher.poll_once()
+    watcher.poll_once()
+    conv_ids = {s.conversation_id for s in seen}
+    assert conv_ids == {parent_id, worker1_id, worker2_id}
+    assert parent_id not in watcher._subagent_conversations
+
 
