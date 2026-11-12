@@ -11,11 +11,13 @@ import subprocess
 import time
 
 from agy_token_viz.pty_runner import (
+    PTYVisualizerRunner,
     filter_footer_mouse_events,
     inject_scroll_region_guards,
     set_pty_winsize,
     split_complete_terminal_bytes,
 )
+from agy_token_viz.state import SessionTokenState
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -602,6 +604,404 @@ time.sleep(0.35)
     assert b"\x1b[24;1H\x1b[2K" in during_alt
     assert b"\x1b8\x1b[?2026l" in during_alt
     assert "[jetski-token-viz] Session Token Summary" in text
+
+
+def test_inject_scroll_region_guards_preserves_subregions_and_clamps_resets() -> None:
+    """
+    Regression test: sub-viewport DECSTBM scroll regions (e.g. `\\x1b[1;22r` used by
+    Jetski/Ultraviolet `scrolln` above the sticky user prompt) must NOT be overwritten
+    with `1..child_rows` before the scroll command runs, whereas margin resets (`\\x1b[r`,
+    `\\x1b[;r`, `0` bottom) and out-of-bounds bottom margins (`> child_rows`) must clamp
+    inline to `child_rows`.
+    """
+    active: list[tuple[int, int] | None] = [None]
+
+    # 1. Sub-viewport scroll region stays untouched and records active sub-region
+    assert (
+        inject_scroll_region_guards(b"\x1b[1;22r", child_rows=28, active_region=active)
+        == b"\x1b[1;22r"
+    )
+    assert active[0] == (1, 22)
+
+    assert (
+        inject_scroll_region_guards(b"\x1b[5;22r", child_rows=28, active_region=active)
+        == b"\x1b[5;22r"
+    )
+    assert active[0] == (5, 22)
+
+    # 2. Full Ultraviolet `scrolln` frame: sub-region preserved during `\x1b[2S`, reset `\x1b[;r` clamped
+    uv_scroll_frame = (
+        b"\x1b[?2026h\x1b[1;22r\x1b[22;1H\x1b[2S\x1b[;r\x1b[21;1HNew line\x1b[?2026l"
+    )
+    assert inject_scroll_region_guards(
+        uv_scroll_frame, child_rows=28, active_region=active
+    ) == (
+        b"\x1b[?2026h\x1b[1;22r\x1b[22;1H\x1b[2S\x1b[1;28r\x1b[21;1HNew line\x1b[?2026l"
+    )
+    assert active[0] is None
+
+    # 3. Reset variants and out-of-bounds bottom margins clamp to child_rows
+    for reset_seq in (b"\x1b[r", b"\x1b[;r", b"\x1b[0r", b"\x1b[0;0r", b"\x1b[1;30r", b"\x1b[28;30r"):
+        assert (
+            inject_scroll_region_guards(reset_seq, child_rows=28, active_region=active)
+            == b"\x1b[1;28r"
+        )
+        assert active[0] is None
+
+    # Top > 1 with omitted or out-of-bounds bottom preserves top and clamps bottom
+    for partial_seq in (b"\x1b[5r", b"\x1b[5;r", b"\x1b[5;0r", b"\x1b[5;30r"):
+        assert (
+            inject_scroll_region_guards(partial_seq, child_rows=28, active_region=active)
+            == b"\x1b[5;28r"
+        )
+        assert active[0] == (5, 28)
+
+    # 4. Non-DECSTBM sequences ending in 'r' (`XTRESTORE`, `DECCARA`) pass through untouched
+    non_decstbm = b"\x1b[?1006r\x1b[1;1;10;10$r"
+    assert inject_scroll_region_guards(non_decstbm, child_rows=28) == non_decstbm
+
+    # 5. Footer repaint preserves active sub-region (or clamps it to child_rows) if chunk splits mid-scroll
+    runner = PTYVisualizerRunner(cmd=["true"], state=SessionTokenState(), use_color=False)
+    assert b"\x1b[1;22r" in runner._build_footer_sequence(
+        rows=30, cols=80, reapply_scroll_region=True, scroll_region=(1, 22)
+    )
+    assert b"\x1b[5;28r" in runner._build_footer_sequence(
+        rows=30, cols=80, reapply_scroll_region=True, scroll_region=(5, 30)
+    )
+    assert b"\x1b[1;28r" in runner._build_footer_sequence(
+        rows=30, cols=80, reapply_scroll_region=True, scroll_region=None
+    )
+
+
+class _MiniVT100:
+    """Minimal VT100/xterm screen emulator for verifying sub-region scrolling and footer rows."""
+
+    def __init__(self, rows: int, cols: int) -> None:
+        self.rows = rows
+        self.cols = cols
+        self.norm_grid = self._blank_grid()
+        self.alt_grid = self._blank_grid()
+        self.grid = self.norm_grid
+        self.last_alt_snapshot: list[str] = []
+        self.row = 0
+        self.col = 0
+        self.pending_wrap = False
+        self.scroll_top = 0
+        self.scroll_bottom = rows - 1
+        self._saved_cursor = (0, 0, False)
+        self._alt_saved_cursor = (0, 0, False)
+
+    def _blank_grid(self) -> list[list[str]]:
+        return [[" "] * self.cols for _ in range(self.rows)]
+
+    def _scroll_up(self, count: int) -> None:
+        span = self.scroll_bottom - self.scroll_top + 1
+        n = max(0, min(count, span))
+        for r in range(self.scroll_top, self.scroll_bottom - n + 1):
+            self.grid[r] = self.grid[r + n][:]
+        for r in range(self.scroll_bottom - n + 1, self.scroll_bottom + 1):
+            self.grid[r] = [" "] * self.cols
+
+    def _scroll_down(self, count: int) -> None:
+        span = self.scroll_bottom - self.scroll_top + 1
+        n = max(0, min(count, span))
+        for r in range(self.scroll_bottom, self.scroll_top + n - 1, -1):
+            self.grid[r] = self.grid[r - n][:]
+        for r in range(self.scroll_top, self.scroll_top + n):
+            self.grid[r] = [" "] * self.cols
+
+    def feed(self, raw: bytes) -> None:
+        s = raw.decode("utf-8", errors="replace")
+        i = 0
+        n = len(s)
+        while i < n:
+            ch = s[i]
+            if ch == "\x1b":
+                if i + 1 >= n:
+                    break
+                nxt = s[i + 1]
+                if nxt == "7":
+                    self._saved_cursor = (self.row, self.col, self.pending_wrap)
+                    i += 2
+                    continue
+                if nxt == "8":
+                    self.row, self.col, self.pending_wrap = self._saved_cursor
+                    i += 2
+                    continue
+                if nxt == "M":
+                    self.pending_wrap = False
+                    if self.row == self.scroll_top:
+                        self._scroll_down(1)
+                    elif self.row > 0:
+                        self.row -= 1
+                    i += 2
+                    continue
+                if nxt == "[":
+                    j = i + 2
+                    while j < n and not (0x40 <= ord(s[j]) <= 0x7E):
+                        j += 1
+                    if j >= n:
+                        break
+                    body = s[i + 2 : j]
+                    final = s[j]
+                    self._handle_csi(body, final)
+                    i = j + 1
+                    continue
+                i += 2
+                continue
+            if ch == "\r":
+                self.col = 0
+                self.pending_wrap = False
+            elif ch == "\n":
+                self.pending_wrap = False
+                if self.row == self.scroll_bottom:
+                    self._scroll_up(1)
+                elif self.row < self.rows - 1:
+                    self.row += 1
+            elif ord(ch) >= 0x20:
+                if self.pending_wrap:
+                    self.col = 0
+                    self.pending_wrap = False
+                    if self.row == self.scroll_bottom:
+                        self._scroll_up(1)
+                    elif self.row < self.rows - 1:
+                        self.row += 1
+                self.grid[self.row][self.col] = ch
+                if self.col + 1 >= self.cols:
+                    self.pending_wrap = True
+                else:
+                    self.col += 1
+            i += 1
+
+    def _handle_csi(self, body: str, final: str) -> None:
+        if body.startswith("?"):
+            modes = [m for m in body[1:].split(";") if m]
+            if final == "h" and any(m in ("1049", "1047", "47") for m in modes):
+                self._alt_saved_cursor = (self.row, self.col, self.pending_wrap)
+                self.alt_grid = self._blank_grid()
+                self.grid = self.alt_grid
+                self.row, self.col, self.pending_wrap = 0, 0, False
+                self.scroll_top, self.scroll_bottom = 0, self.rows - 1
+            elif final == "l" and any(m in ("1049", "1047", "47") for m in modes):
+                self.last_alt_snapshot = ["".join(r).rstrip() for r in self.alt_grid]
+                self.grid = self.norm_grid
+                self.row, self.col, self.pending_wrap = self._alt_saved_cursor
+                self.scroll_top, self.scroll_bottom = 0, self.rows - 1
+            return
+
+        if any(not (c.isdigit() or c == ";") for c in body):
+            return
+        parts = body.split(";") if body else []
+        p0 = int(parts[0]) if len(parts) >= 1 and parts[0] else 0
+        p1 = int(parts[1]) if len(parts) >= 2 and parts[1] else 0
+
+        if final in ("H", "f"):
+            self.row = max(0, min(self.rows - 1, (p0 or 1) - 1))
+            self.col = max(0, min(self.cols - 1, (p1 or 1) - 1))
+            self.pending_wrap = False
+        elif final == "A":
+            self.row = max(0, self.row - (p0 or 1))
+            self.pending_wrap = False
+        elif final == "J":
+            self.pending_wrap = False
+            if p0 == 2:
+                for r in range(self.rows):
+                    self.grid[r] = [" "] * self.cols
+            elif p0 == 0:
+                for c in range(self.col, self.cols):
+                    self.grid[self.row][c] = " "
+                for r in range(self.row + 1, self.rows):
+                    self.grid[r] = [" "] * self.cols
+        elif final == "K":
+            self.pending_wrap = False
+            if p0 == 2:
+                self.grid[self.row] = [" "] * self.cols
+            elif p0 == 0:
+                for c in range(self.col, self.cols):
+                    self.grid[self.row][c] = " "
+        elif final == "r":
+            top = p0 or 1
+            bot = (p1 if len(parts) >= 2 and parts[1] else 0) or self.rows
+            if 1 <= top < bot <= self.rows:
+                self.scroll_top = top - 1
+                self.scroll_bottom = bot - 1
+                self.row, self.col, self.pending_wrap = 0, 0, False
+        elif final == "S":
+            self.pending_wrap = False
+            self._scroll_up(p0 or 1)
+        elif final == "T":
+            self.pending_wrap = False
+            self._scroll_down(p0 or 1)
+
+
+def test_jetski_subregion_hardware_scroll_never_overlaps_prompt_or_footer(
+    tmp_path: Path,
+) -> None:
+    """
+    End-to-end regression test reproducing the Jetski `--visualize-tokens` UI overlap bug:
+    - Outer terminal is 30x80; child PTY gets 28x80 (rows 1..22 = conversation viewport,
+      rows 23..28 = sticky user prompt box, rows 29..30 = live 2-line token footer).
+    - Fake Jetski TUI paints the sticky user prompt box ONCE on frame 1 (matching
+      Ultraviolet's diff renderer `curbuf`, which assumes rows 23..28 never move when
+      scrolling inside `\\x1b[1;22r`) and then streams generated text using Ultraviolet's
+      exact hardware scroll sequences:
+        1. `\\x1b[1;22r` + `\\x1b[1;1H\\x1b[2T` + `\\x1b[;r` (multi-line scroll down)
+        2. `\\x1b[1;22r` + `\\x1b[22;1H\\x1b[3S` + `\\x1b[;r` (multi-line scroll up)
+        3. `\\x1b[1;22r` + `\\x1b[22;1H\\n` + `\\x1b[;r` (single-line LF scroll up)
+    - Verifies on a VT100 screen emulator that generated text never overlaps the user
+      prompt area, the user prompt box never scrolls up into the generated text area,
+      and the 2-line token footer stays intact on rows 29..30.
+    """
+    fake_jetski_scroll = tmp_path / "fake_jetski_scroll"
+    fake_jetski_scroll.write_text(
+        """#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+
+data_dir = os.environ.get("JETSKI_DATA_DIR")
+if data_dir:
+    logs = pathlib.Path(data_dir) / "brain" / "scroll-conv-001" / ".system_generated" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    step = {
+        "step_index": 1,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "input_tokens": 3200,
+        "cache_read_tokens": 6400,
+        "output_tokens": 450,
+        "content": "Streaming response",
+    }
+    (logs / "transcript.jsonl").write_text(json.dumps(step) + "\\n", encoding="utf-8")
+
+# Frame 1: Initial full render (rows 1..22 = generated text, rows 23..28 = sticky user prompt)
+out = ["\\x1b[?1049h\\x1b[?2026h\\x1b[H\\x1b[2J"]
+for r in range(1, 23):
+    out.append(f"\\x1b[{r};1HGen line {r:02d} - initial response content")
+prompt_rows = [
+    "┌────────────────────── User Prompt ──────────────────────┐",
+    "│ > Follow-up prompt typed here                           │",
+    "│                                                         │",
+    "│ [Enter to send]                                         │",
+    "└─────────────────────────────────────────────────────────┘",
+    "  gemini-2.5-pro · /Users/dev/project",
+]
+for idx, p_line in enumerate(prompt_rows, start=23):
+    out.append(f"\\x1b[{idx};1H{p_line}")
+out.append("\\x1b[?2026l")
+sys.stdout.write("".join(out))
+sys.stdout.flush()
+time.sleep(0.08)
+
+# Frame 2: Sub-region scroll DOWN by 2 (`scrollDown`: `\\x1b[1;22r` + `\\x1b[1;1H\\x1b[2T` + `\\x1b[;r`)
+# Must clip at row 22 and NEVER push `Gen line 21/22` down into prompt rows 23..24!
+sys.stdout.write(
+    "\\x1b[?2026h"
+    "\\x1b[1;22r\\x1b[1;1H\\x1b[2T\\x1b[;r"
+    "\\x1b[1;1HInserted top 01"
+    "\\x1b[2;1HInserted top 02"
+    "\\x1b[?2026l"
+)
+sys.stdout.flush()
+time.sleep(0.08)
+
+# Frame 3: Sub-region scroll UP by 3 (`scrollUp`: `\\x1b[1;22r` + `\\x1b[22;1H\\x1b[3S` + `\\x1b[;r`)
+# Must NOT pull prompt rows 23..25 up into rows 20..22! Diff-paint without `\\x1b[2K`.
+sys.stdout.write(
+    "\\x1b[?2026h"
+    "\\x1b[1;22r\\x1b[22;1H\\x1b[3S\\x1b[;r"
+    "\\x1b[20;1HGen tail A"
+    "\\x1b[21;1HGen tail B"
+    "\\x1b[22;1HGen tail C - long trailing words"
+    "\\x1b[?2026l"
+)
+sys.stdout.flush()
+time.sleep(0.08)
+
+# Frame 4: Sub-region 1-line LF scroll UP (`\\x1b[1;22r` + `\\x1b[22;1H\\n` + `\\x1b[;r`)
+# Row 22 must scroll `Gen tail C - long trailing words` up to row 21 and blank row 22
+# so short `FINAL_END` has no trailing leftover characters!
+sys.stdout.write(
+    "\\x1b[?2026h"
+    "\\x1b[1;22r\\x1b[22;1H\\n\\x1b[;r"
+    "\\x1b[22;1HFINAL_END"
+    "\\x1b[?2026l"
+)
+sys.stdout.flush()
+time.sleep(0.25)
+
+# Cleanly exit alt-screen so `_MiniVT100` snapshots the final alt-screen grid
+sys.stdout.write("\\x1b[?1049l")
+sys.stdout.flush()
+""",
+        encoding="utf-8",
+    )
+    fake_jetski_scroll.chmod(fake_jetski_scroll.stat().st_mode | stat.S_IXUSR)
+
+    master_fd, slave_fd = pty.openpty()
+    set_pty_winsize(slave_fd, 30, 80)
+    env = {
+        **os.environ,
+        "JETSKI_REAL_BIN": str(fake_jetski_scroll),
+        "JETSKI_DATA_DIR": str(tmp_path / "jetski_scroll_data"),
+        "TERM": "xterm-256color",
+    }
+    proc = subprocess.Popen(
+        [str(BIN_JETSKI), "--visualize-tokens", "--viz-heuristic-only"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+
+    captured = bytearray()
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([master_fd], [], [], 0.1)
+        if ready:
+            try:
+                chunk = os.read(master_fd, 8192)
+                if not chunk:
+                    break
+                captured.extend(chunk)
+            except OSError:
+                break
+        elif proc.poll() is not None:
+            break
+
+    os.close(master_fd)
+    assert proc.wait(timeout=5) == 0
+
+    vt = _MiniVT100(rows=30, cols=80)
+    vt.feed(bytes(captured))
+    snap = vt.last_alt_snapshot
+    assert len(snap) == 30
+
+    # 1. Conversation viewport (rows 1..22, 0-indexed 0..21): exact scrolled generated text,
+    #    zero prompt box characters (`┌`, `│`, `└`, `User Prompt`), zero un-cleared tail bleed.
+    assert snap[18] == "Gen tail A"
+    assert snap[19] == "Gen tail B"
+    assert snap[20] == "Gen tail C - long trailing words"
+    assert snap[21] == "FINAL_END"
+    for r in range(0, 22):
+        assert "User Prompt" not in snap[r]
+        assert "Follow-up prompt" not in snap[r]
+        assert "┌" not in snap[r] and "└" not in snap[r]
+
+    # 2. Sticky user prompt area (rows 23..28, 0-indexed 22..27): 100% intact, zero generated text overlap
+    assert snap[22] == "┌────────────────────── User Prompt ──────────────────────┐"
+    assert snap[23] == "│ > Follow-up prompt typed here                           │"
+    assert snap[24] == "│                                                         │"
+    assert snap[25] == "│ [Enter to send]                                         │"
+    assert snap[26] == "└─────────────────────────────────────────────────────────┘"
+    assert snap[27] == "  gemini-2.5-pro · /Users/dev/project"
+
+    # 3. Reserved 2-line token visualizer footer (rows 29..30, 0-indexed 28..29): intact at bottom
+    assert "Tokens" in snap[28]
+    assert "In:" in snap[28] or "I:" in snap[28]
+    assert snap[29] != ""
+
 
 
 

@@ -29,35 +29,100 @@ BAR_ROWS = 2
 MIN_TERMINAL_ROWS_FOR_FOOTER = 6
 SYNC_UPDATE_TIMEOUT_SEC = 0.25
 
-# Detect child sequences that reset scroll margins or clear/switch screen buffers
-_REGION_OR_CLEAR_RE = re.compile(
-    rb"\x1b\[(?:\?(?:1049|1047|47)[hl]|[012]?J|[0-9;]*r)"
+# Detect child sequences that clear the screen, switch screen buffers, or reset terminal
+# state (requiring the 2-line footer at `rows - 1..rows` to be repainted).
+_CLEAR_OR_BUFFER_RE = re.compile(
+    rb"\x1b\[(?:\?(?:[0-9]+;)*(?:1049|1047|47)(?:;[0-9]+)*[hl]|[012]?J|!p)|\x1bc"
 )
 
 # Track alternate screen buffer entry ('h') and exit ('l')
-_ALT_BUFFER_RE = re.compile(rb"\x1b\[\?(?:1049|1047|47)([hl])")
+_ALT_BUFFER_RE = re.compile(
+    rb"\x1b\[\?(?:[0-9]+;)*(?:1049|1047|47)(?:;[0-9]+)*([hl])"
+)
 
 # Track DEC Mode 2026 synchronized output begin ('h') and end ('l')
-_SYNC_UPDATE_RE = re.compile(rb"\x1b\[\?2026([hl])")
+_SYNC_UPDATE_RE = re.compile(rb"\x1b\[\?(?:[0-9]+;)*2026(?:;[0-9]+)*([hl])")
 
-# Child sequences that enter/exit the alternate screen buffer or reset DECSTBM scroll margins
-_MARGIN_RESTORE_RE = re.compile(rb"\x1b\[(?:\?(?:1049|1047|47)[hl]|[0-9;]*r)")
+# Child sequences that switch/reset screen buffers (`?1049h/l`, `DECSTR`, `RIS`) or
+# configure `DECSTBM` top/bottom scroll margins (`\x1b[Pt;Pbr`).
+_SCROLL_GUARD_RE = re.compile(
+    rb"(?P<reset>\x1b\[(?:\?(?:[0-9]+;)*(?:1049|1047|47)(?:;[0-9]+)*[hl]|!p)|\x1bc)"
+    rb"|\x1b\[(?P<decstbm>[0-9;]*)r"
+)
 
 # SGR mouse events (`\x1b[<btn;col;rowM` or `\x1b[<btn;col;rowm`)
 _SGR_MOUSE_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 
 
-def inject_scroll_region_guards(data: bytes, child_rows: int) -> bytes:
+def _parse_decstbm_params(params: bytes) -> tuple[int, int | None] | None:
     """
-    Immediately re-apply `DECSTBM` (`\\x1b7\\x1b[1;{child_rows}r\\x1b8`) right after any
-    sequence in `data` that switches alternate/normal screen buffers (`\\x1b[?1049h/l`) or
-    resets scroll margins (`\\x1b[...r`), before subsequent newlines or scrolls in the same
-    chunk can overwrite the reserved bottom footer rows.
+    Parse `DECSTBM` (`CSI Pt ; Pb r`) parameter bytes into `(top, bottom)`.
+
+    Returns `(top, bottom)` where `top >= 1` and `bottom` is `None` when omitted or `0`
+    (meaning VT100/xterm default full-terminal bottom margin), or returns `None` if
+    `params` has more than two semicolon-separated fields.
     """
-    if not data or not _MARGIN_RESTORE_RE.search(data):
+    if not params:
+        return 1, None
+    parts = params.split(b";")
+    if len(parts) > 2:
+        return None
+    top_raw = int(parts[0]) if parts[0] else 0
+    top = 1 if top_raw == 0 else top_raw
+    if len(parts) == 1:
+        return top, None
+    bot_raw = int(parts[1]) if parts[1] else 0
+    bottom = None if bot_raw == 0 else bot_raw
+    return top, bottom
+
+
+def inject_scroll_region_guards(
+    data: bytes,
+    child_rows: int,
+    *,
+    active_region: list[tuple[int, int] | None] | None = None,
+) -> bytes:
+    """
+    Keep `DECSTBM` scroll margins confined within `1..child_rows` so child scrolling never
+    reaches the reserved 2-line footer, while preserving valid sub-viewport scroll regions
+    (e.g. `\\x1b[1;22r` used by Jetski/Ultraviolet to scroll generated text above the
+    sticky user prompt area).
+
+    - Buffer switches / resets (`\\x1b[?1049h/l`, `\\x1b[!p`, `\\x1bc`): append
+      `\\x1b7\\x1b[1;{child_rows}r\\x1b8` so margins are confined without disturbing the
+      restored/current cursor position.
+    - Valid child sub-regions (`1 <= top < bottom <= child_rows`): pass through untouched.
+    - Margin resets (`\\x1b[r`, `\\x1b[;r`, `0` bottom) or out-of-bounds bottom margins
+      (`bottom > child_rows`): clamp inline to `\\x1b[{clamped_top};{child_rows}r`.
+    """
+    if not data or not _SCROLL_GUARD_RE.search(data):
         return data
-    guard = f"\x1b7\x1b[1;{max(1, child_rows)}r\x1b8".encode("ascii")
-    return _MARGIN_RESTORE_RE.sub(lambda m: m.group(0) + guard, data)
+
+    max_row = max(1, child_rows)
+    guard = f"\x1b7\x1b[1;{max_row}r\x1b8".encode("ascii")
+    region_state = active_region if active_region is not None else [None]
+
+    def _replace(match: re.Match[bytes]) -> bytes:
+        if match.group("reset") is not None:
+            region_state[0] = None
+            return match.group(0) + guard
+
+        parsed = _parse_decstbm_params(match.group("decstbm"))
+        if parsed is None:
+            return match.group(0)
+
+        top, bottom = parsed
+        if bottom is not None and bottom <= max_row:
+            if top < bottom:
+                region_state[0] = None if (top == 1 and bottom == max_row) else (top, bottom)
+            return match.group(0)
+
+        clamped_bottom = max_row
+        clamped_top = top if top < clamped_bottom else 1
+        region_state[0] = None if clamped_top == 1 else (clamped_top, clamped_bottom)
+        return f"\x1b[{clamped_top};{clamped_bottom}r".encode("ascii")
+
+    return _SCROLL_GUARD_RE.sub(_replace, data)
 
 
 def filter_footer_mouse_events(
@@ -312,18 +377,24 @@ class PTYVisualizerRunner:
         rows: int,
         cols: int,
         reapply_scroll_region: bool = False,
+        scroll_region: tuple[int, int] | None = None,
     ) -> bytes:
         child_rows = max(1, rows - BAR_ROWS)
         snap = self._state.snapshot()
         line1, line2 = render_status_lines(snap, cols=cols, use_color=self._use_color)
 
         # IMPORTANT: Save child cursor & SGR state (\x1b7) BEFORE resetting SGR (\x1b[0m)
-        # and DECSTBM (\x1b[1;{child_rows}r). Resetting SGR before `\x1b[2K` prevents active
-        # 24-bit RGB background colors in alt-screen TUIs from bleeding via Background Color
-        # Erase (BCE); `\x1b8` restores the child's saved cursor position and SGR attributes.
+        # and DECSTBM. Resetting SGR before `\x1b[2K` prevents active 24-bit RGB background
+        # colors in alt-screen TUIs from bleeding via Background Color Erase (BCE); `\x1b8`
+        # restores the child's saved cursor position and SGR attributes.
         parts: list[str] = ["\x1b7\x1b[0m"]
         if reapply_scroll_region:
-            parts.append(f"\x1b[1;{child_rows}r")
+            if scroll_region is not None:
+                reg_bottom = min(scroll_region[1], child_rows)
+                reg_top = scroll_region[0] if scroll_region[0] < reg_bottom else 1
+            else:
+                reg_top, reg_bottom = 1, child_rows
+            parts.append(f"\x1b[{reg_top};{reg_bottom}r")
         parts.append(f"\x1b[{rows - 1};1H\x1b[2K{line1}")
         parts.append(f"\x1b[{rows};1H\x1b[2K{line2}")
         parts.append("\x1b8")
@@ -412,10 +483,16 @@ class PTYVisualizerRunner:
         in_sync_update = False
         sync_started_at = 0.0
         pending_region_restore = False
+        active_scroll_region: list[tuple[int, int] | None] = [None]
         suppressing_footer_click = [False]
 
         def _track_terminal_modes(raw: bytes, now_ts: float) -> None:
             nonlocal in_alt_screen, in_sync_update, sync_started_at
+            reset_idx = raw.rfind(b"\x1bc")
+            if reset_idx != -1:
+                in_alt_screen = False
+                in_sync_update = False
+                raw = raw[reset_idx + 2 :]
             for alt_m in _ALT_BUFFER_RE.finditer(raw):
                 in_alt_screen = alt_m.group(1) == b"h"
             for sync_m in _SYNC_UPDATE_RE.finditer(raw):
@@ -457,12 +534,16 @@ class PTYVisualizerRunner:
                     rows, cols = get_terminal_size(tty_out_fd)
                     use_footer = rows >= MIN_TERMINAL_ROWS_FOR_FOOTER
                     child_rows = max(1, rows - BAR_ROWS) if use_footer else rows
+                    active_scroll_region[0] = None
                     set_pty_winsize(master_fd, child_rows, cols)
                     if use_footer and not in_sync_update:
                         _write_all(
                             tty_out_fd,
                             self._build_footer_sequence(
-                                rows, cols, reapply_scroll_region=True
+                                rows,
+                                cols,
+                                reapply_scroll_region=True,
+                                scroll_region=active_scroll_region[0],
                             ),
                         )
                         last_bar_paint = time.monotonic()
@@ -522,8 +603,12 @@ class PTYVisualizerRunner:
                         if use_footer:
                             now = time.monotonic()
                             _track_terminal_modes(complete, now)
-                            guarded = inject_scroll_region_guards(complete, child_rows)
-                            chunk_needs_region = bool(_REGION_OR_CLEAR_RE.search(complete))
+                            guarded = inject_scroll_region_guards(
+                                complete,
+                                child_rows,
+                                active_region=active_scroll_region,
+                            )
+                            chunk_needs_region = bool(_CLEAR_OR_BUFFER_RE.search(complete))
 
                             if in_sync_update:
                                 if chunk_needs_region:
@@ -539,6 +624,7 @@ class PTYVisualizerRunner:
                                         rows,
                                         cols,
                                         reapply_scroll_region=needs_region,
+                                        scroll_region=active_scroll_region[0],
                                     )
                                     if guarded.endswith(b"\x1b[?2026l"):
                                         out_payload = guarded[:-8] + footer + b"\x1b[?2026l"
@@ -568,7 +654,10 @@ class PTYVisualizerRunner:
                     _write_all(
                         tty_out_fd,
                         self._build_footer_sequence(
-                            rows, cols, reapply_scroll_region=pending_region_restore
+                            rows,
+                            cols,
+                            reapply_scroll_region=pending_region_restore,
+                            scroll_region=active_scroll_region[0],
                         ),
                     )
                     last_bar_paint = now
