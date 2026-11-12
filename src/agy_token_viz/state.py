@@ -202,6 +202,56 @@ class SessionTokenState:
         if cb is not None:
             cb()
 
+    def seed_conversation_baseline(
+        self,
+        conversation_id: str,
+        *,
+        prev_prompt_tokens: int,
+        prev_visible_end_context: int,
+        prev_end_context: int,
+    ) -> None:
+        """
+        Seed prior context size for an existing conversation without recording its
+        historical tokens into the current session's active counters.
+        """
+        with self._lock:
+            if conversation_id not in self._conversations:
+                self._conversations[conversation_id] = _ConversationContextState(
+                    prev_prompt_tokens=max(0, prev_prompt_tokens),
+                    prev_visible_end_context=max(0, prev_visible_end_context),
+                    prev_end_context=max(0, prev_end_context),
+                    last_tool_step_key=None,
+                )
+
+    def reset(self, preserve_baselines: bool = True) -> None:
+        """Reset all session token counters and category buckets (e.g., on `/new` conversation)."""
+        cb: Callable[[], None] | None = None
+        with self._lock:
+            base_cats = tuple(
+                c for c in self._categories if c != Category.HARNESS_OVERHEAD
+            )
+            self._categories = base_cats if base_cats else DEFAULT_CATEGORIES
+            self._category_lookup = {c.lower(): c for c in self._categories}
+            self._buckets = {c: _MutableCategoryTotals() for c in self._categories}
+            self._seen_steps.clear()
+            self._pending_records.clear()
+            self._classified_step_category.clear()
+            if not preserve_baselines:
+                self._conversations.clear()
+            self._total_input_tokens = 0
+            self._total_billed_input_tokens = 0
+            self._total_cache_read_tokens = 0
+            self._total_output_tokens = 0
+            self._total_thinking_tokens = 0
+            self._total_harness_overhead_tokens = 0
+            self._unclassified_active_tokens = 0
+            self._classified_steps = 0
+            self._last_category = None
+            self._started_at = time.monotonic()
+            cb = self._on_change
+        if cb is not None:
+            cb()
+
     def register_step(self, record: StepRecord) -> bool:
         """Record a newly observed step immediately; classification completes asynchronously."""
         key = (record.conversation_id, record.step_index)

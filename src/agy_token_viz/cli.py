@@ -17,7 +17,9 @@ from agy_token_viz.router import (
 from agy_token_viz.state import SessionTokenState
 from agy_token_viz.transcript_watcher import (
     TranscriptWatcher,
+    extract_log_file_from_args,
     extract_target_conversation_from_args,
+    is_resuming_conversation_from_args,
 )
 
 
@@ -169,11 +171,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     target_conv = extract_target_conversation_from_args(agy_args)
+    is_resuming = is_resuming_conversation_from_args(agy_args)
+    explicit_log = extract_log_file_from_args(agy_args)
     watcher = TranscriptWatcher(
         agy_data_dir=config.agy_data_dir,
         on_step=classifier.submit,
         target_conversation_id=target_conv,
         include_history=config.include_history,
+        exclude_preexisting=not is_resuming,
+        lock_to_first_conversation=True,
+        on_baseline_context=lambda conv_id, prompt_tok, vis_end, end_ctx: (
+            state.seed_conversation_baseline(
+                conv_id,
+                prev_prompt_tokens=prompt_tok,
+                prev_visible_end_context=vis_end,
+                prev_end_context=end_ctx,
+            )
+        ),
+        on_reset=state.reset,
+        explicit_log_file=explicit_log,
     )
 
     def _before_spawn() -> None:
@@ -186,7 +202,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         state=state,
     )
 
-    exit_code = runner.run(on_before_spawn=_before_spawn)
+    exit_code = runner.run(
+        on_before_spawn=_before_spawn,
+        on_process_spawn=watcher.set_child_pid,
+    )
 
     # Flush final transcript lines and let pending step classifications finish
     watcher.stop(timeout=1.5)

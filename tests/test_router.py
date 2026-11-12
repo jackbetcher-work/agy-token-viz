@@ -302,3 +302,78 @@ def test_format_step_for_classifier_annotates_tool_domains_and_compacts_paths() 
     )
     assert "[exploration: read/inspect]" in text
     assert "read_file(.../src/pkg/module.py)" in text
+
+
+def test_silence_llama_cpp_logs_disables_fd_dup2_suppression() -> None:
+    import os
+    from agy_token_viz.router import _silence_llama_cpp_logs
+
+    _silence_llama_cpp_logs()
+    try:
+        import llama_cpp._utils as llama_utils  # type: ignore[import-untyped]
+    except ImportError:
+        return
+
+    r_fd, w_fd = os.pipe()
+    saved_stdout = os.dup(1)
+    try:
+        os.dup2(w_fd, 1)
+        with llama_utils.suppress_stdout_stderr(disable=False):
+            os.write(1, b"LOGO_VISIBLE")
+        os.close(w_fd)
+        w_fd = -1
+        assert os.read(r_fd, 64) == b"LOGO_VISIBLE"
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.close(saved_stdout)
+        if w_fd != -1:
+            os.close(w_fd)
+        os.close(r_fd)
+
+
+def test_async_step_classifier_skips_model_load_for_deterministic_guardrail_steps(
+    tmp_path: Path,
+) -> None:
+    local_gguf = tmp_path / "lazy.gguf"
+    local_gguf.write_bytes(b"DUMMY")
+    spec = resolve_model_spec(str(local_gguf))
+    load_calls: list[int] = []
+
+    class _TrackingLlama:
+        def __init__(self, **kwargs: Any) -> None:
+            load_calls.append(1)
+
+        def create_chat_completion(self, **kwargs: Any) -> dict[str, Any]:
+            return {"choices": [{"message": {"content": "Coding"}}]}
+
+    router = OpenModelRouter(
+        model_spec=spec,
+        model_dir=tmp_path,
+        llm_factory=lambda **kw: _TrackingLlama(**kw),
+    )
+    state = SessionTokenState()
+    worker = AsyncStepClassifier(state=state, router=router)
+    worker.start()
+
+    # Submit unambiguous steps: Exploration, Coding, Testing, Communication
+    worker.submit(
+        StepRecord("c-lazy", 1, 1000, 0, 100, tool_calls=(ToolCallSummary("read_file", "a.py"),))
+    )
+    worker.submit(
+        StepRecord("c-lazy", 2, 500, 1000, 200, tool_calls=(ToolCallSummary("edit_file", "a.py"),))
+    )
+    worker.submit(
+        StepRecord("c-lazy", 3, 400, 1500, 150, tool_calls=(ToolCallSummary("run_command", "pytest -q"),))
+    )
+    worker.submit(
+        StepRecord("c-lazy", 4, 300, 1900, 250, content="All tests pass now.")
+    )
+    worker.stop(timeout=3.0)
+
+    snap = state.snapshot()
+    assert snap.classified_steps == 4
+    # Because all 4 steps resolved via deterministic tool guardrails, GGUF load was never triggered
+    assert load_calls == []
+    assert router.is_loaded is False
+
+

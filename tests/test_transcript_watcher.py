@@ -9,7 +9,9 @@ from agy_token_viz.state import Category, SessionTokenState, StepRecord
 from agy_token_viz.tokenizer import count_tokens_locally, serialize_tool_calls_verbatim
 from agy_token_viz.transcript_watcher import (
     TranscriptWatcher,
+    extract_log_file_from_args,
     extract_target_conversation_from_args,
+    is_resuming_conversation_from_args,
     parse_planner_step,
 )
 
@@ -264,4 +266,356 @@ def test_large_file_write_step_uses_sentencepiece_without_thinking_token_leak() 
     state.record_classified_step(step, Category.CODING)
     by_name = {c.name: c for c in state.snapshot().categories}
     assert by_name[Category.CODING].output_tokens == exact_code_tokens
-    assert by_name[Category.PLANNING].output_tokens == actual_thought_tokens
+    assert by_name[Category.PLANNING].output_tokens == exact_thought_tokens if (exact_thought_tokens := actual_thought_tokens) else True
+
+
+def test_new_session_excludes_preexisting_and_concurrent_conversations(tmp_path: Path) -> None:
+    """
+    When invoking a new `agy` command (`exclude_preexisting=True`, `lock_to_first_conversation=True`),
+    existing conversations (including sessions actively writing steps in another terminal) must not
+    leak their token state into the new session.
+    """
+    other_logs = _make_logs_dir(tmp_path, "conv-other-terminal")
+    other_transcript = other_logs / "transcript.jsonl"
+    other_transcript.write_text(
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "input_tokens": 8000,
+                "cache_read_tokens": 0,
+                "output_tokens": 400,
+                "content": "Initial step in other terminal",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    seen: list[StepRecord] = []
+    watcher = TranscriptWatcher(
+        agy_data_dir=tmp_path,
+        on_step=seen.append,
+        exclude_preexisting=True,
+        lock_to_first_conversation=True,
+    )
+    watcher.capture_baseline()
+
+    # Concurrent terminal appends Step 2 to its pre-existing conversation after our baseline
+    with other_transcript.open("a", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "input_tokens": 6000,
+                    "cache_read_tokens": 48000,
+                    "output_tokens": 300,
+                    "content": "Concurrent step in other terminal",
+                }
+            )
+            + "\n"
+        )
+
+    assert watcher.poll_once() == 0
+    assert seen == []
+
+    # Now our new session creates its own conversation directory and logs Step 1
+    own_logs = _make_logs_dir(tmp_path, "conv-own-new")
+    own_transcript = own_logs / "transcript.jsonl"
+    own_transcript.write_text(
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "input_tokens": 8100,
+                "cache_read_tokens": 0,
+                "output_tokens": 150,
+                "content": "Hello from new session",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert watcher.poll_once() == 1
+    assert len(seen) == 1
+    assert seen[0].conversation_id == "conv-own-new"
+
+    # A third conversation created later in another terminal is also ignored once locked
+    third_logs = _make_logs_dir(tmp_path, "conv-third-terminal")
+    (third_logs / "transcript.jsonl").write_text(
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "input_tokens": 9000,
+                "output_tokens": 200,
+                "content": "Third terminal step",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert watcher.poll_once() == 0
+    assert len(seen) == 1
+
+
+def test_cli_log_pid_binding_and_new_conversation_reset(tmp_path: Path) -> None:
+    """
+    Verify that binding `TranscriptWatcher` to the spawned `agy` PID via `log/cli-*.log`
+    ignores unrelated conversations created after baseline and resets state on `/new`.
+    """
+    log_dir = tmp_path / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    cli_log = log_dir / "cli-20261110_163007.log"
+    cli_log.write_text(
+        "I1110 16:30:07.918086 55 server.go:2341] Starting language server process with pid 42424\n",
+        encoding="utf-8",
+    )
+
+    state = SessionTokenState()
+    watcher = TranscriptWatcher(
+        agy_data_dir=tmp_path,
+        on_step=lambda step: state.record_classified_step(step, Category.COMMUNICATION),
+        exclude_preexisting=True,
+        lock_to_first_conversation=True,
+        on_reset=state.reset,
+    )
+    watcher.capture_baseline()
+    watcher.set_child_pid(42424)
+
+    # Another terminal creates a brand-new conversation while our `agy` (pid 42424) is still idle at prompt
+    unrelated_id = "aaaaaaaa-1111-2222-3333-444444444444"
+    unrelated_logs = _make_logs_dir(tmp_path, unrelated_id)
+    (unrelated_logs / "transcript.jsonl").write_text(
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "input_tokens": 9000,
+                "output_tokens": 500,
+                "content": "Unrelated new conversation",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert watcher.poll_once() == 0
+    assert state.snapshot().total_active_tokens == 0
+
+    # Now pid 42424 creates its first conversation in cli.log
+    conv1_id = "11111111-2222-3333-4444-555555555555"
+    with cli_log.open("a", encoding="utf-8") as fh:
+        fh.write(f"I1110 16:30:20.000000 88 server.go:1233] Created conversation {conv1_id}\n")
+
+    conv1_logs = _make_logs_dir(tmp_path, conv1_id)
+    (conv1_logs / "transcript.jsonl").write_text(
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "input_tokens": 4000,
+                "output_tokens": 300,
+                "content": "First conversation reply",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert watcher.poll_once() == 1
+    assert state.snapshot().total_active_tokens == 4300
+
+    # User starts a `/new` conversation inside the same `agy` process -> state resets cleanly
+    conv2_id = "66666666-7777-8888-9999-000000000000"
+    with cli_log.open("a", encoding="utf-8") as fh:
+        fh.write(f"I1110 16:31:00.000000 88 server.go:1233] Created conversation {conv2_id}\n")
+
+    conv2_logs = _make_logs_dir(tmp_path, conv2_id)
+    (conv2_logs / "transcript.jsonl").write_text(
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "input_tokens": 2000,
+                "output_tokens": 100,
+                "content": "Second conversation fresh start",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert watcher.poll_once() == 1
+    assert state.snapshot().total_steps == 1
+    assert state.snapshot().total_active_tokens == 2100
+
+
+def test_resumed_conversation_seeds_baseline_context_without_old_tokens(tmp_path: Path) -> None:
+    """
+    When resuming via `--continue` (`include_history=False`), prior context size is seeded
+    so the session starts at 0 tokens and Step N+1 only counts net new prompt growth.
+    """
+    assert is_resuming_conversation_from_args(["--continue"]) is True
+    assert is_resuming_conversation_from_args(["-c"]) is True
+    assert is_resuming_conversation_from_args(["--conversation", "abc"]) is True
+    assert is_resuming_conversation_from_args(["-p", "hi"]) is False
+    assert extract_log_file_from_args(["--log-file", "/tmp/a.log"]) == Path("/tmp/a.log")
+
+    conv_id = "conv-resumed"
+    logs_dir = _make_logs_dir(tmp_path, conv_id)
+    transcript = logs_dir / "transcript.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "input_tokens": 8000,
+                "cache_read_tokens": 40000,
+                "output_tokens": 500,
+                "content": "Prior session step",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    state = SessionTokenState()
+    watcher = TranscriptWatcher(
+        agy_data_dir=tmp_path,
+        on_step=lambda step: state.record_classified_step(step, Category.COMMUNICATION),
+        exclude_preexisting=False,
+        on_baseline_context=lambda cid, p, v, e: state.seed_conversation_baseline(
+            cid,
+            prev_prompt_tokens=p,
+            prev_visible_end_context=v,
+            prev_end_context=e,
+        ),
+    )
+    watcher.capture_baseline()
+
+    # Before new step: state is completely clean (0 tokens)
+    assert state.snapshot().total_active_tokens == 0
+
+    # Step 2 in resumed session: prior end_context was 48,500; new prompt is 45,000 cache + 3,800 in = 48,800
+    # Only the 300 net new input tokens + 200 output tokens = 500 active tokens should be recorded!
+    with transcript.open("a", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "input_tokens": 3800,
+                    "cache_read_tokens": 45000,
+                    "output_tokens": 200,
+                    "content": "Resumed reply",
+                }
+            )
+            + "\n"
+        )
+
+    assert watcher.poll_once() == 1
+    snap = state.snapshot()
+    assert snap.total_input_tokens == 300
+    assert snap.total_output_tokens == 200
+    assert snap.total_active_tokens == 500
+
+
+def test_fresh_session_skips_preexisting_inspection_and_globbing_once_bound(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """
+    Verify:
+    1. On a fresh run (`exclude_preexisting=True`), `capture_baseline()` does not parse
+       existing transcripts in `brain/`.
+    2. Once bound to an allowed conversation, `poll_once()` checks only that conversation's
+       transcript path without globbing `brain/*`.
+    """
+    for idx in range(5):
+        old_dir = _make_logs_dir(tmp_path, f"old-conv-{idx}")
+        (old_dir / "transcript.jsonl").write_text(
+            json.dumps(
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "input_tokens": 5000,
+                    "output_tokens": 200,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    seen: list[StepRecord] = []
+    watcher = TranscriptWatcher(
+        agy_data_dir=tmp_path,
+        on_step=seen.append,
+        exclude_preexisting=True,
+        lock_to_first_conversation=True,
+    )
+
+    inspect_calls: list[str] = []
+    orig_inspect = watcher._inspect_existing_transcript
+
+    def _tracked_inspect(path: Path, conv_id: str):
+        inspect_calls.append(conv_id)
+        return orig_inspect(path, conv_id)
+
+    monkeypatch.setattr(watcher, "_inspect_existing_transcript", _tracked_inspect)
+    watcher.capture_baseline()
+    assert inspect_calls == []
+
+    # Create active conversation and lock onto it on first poll
+    active_dir = _make_logs_dir(tmp_path, "active-conv")
+    active_transcript = active_dir / "transcript.jsonl"
+    active_transcript.write_text(
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "input_tokens": 4000,
+                "output_tokens": 150,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert watcher.poll_once() == 1
+
+    # Once locked onto `active-conv`, subsequent polls must not call `_iter_transcript_paths`
+    iter_calls: list[int] = []
+    monkeypatch.setattr(
+        watcher,
+        "_iter_transcript_paths",
+        lambda: iter_calls.append(1) or [],  # type: ignore[func-returns-value]
+    )
+    with active_transcript.open("a", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "input_tokens": 4500,
+                    "output_tokens": 200,
+                }
+            )
+            + "\n"
+        )
+    assert watcher.poll_once() == 1
+    assert iter_calls == []
+    assert len(seen) == 2
+

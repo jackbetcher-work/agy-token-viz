@@ -4,14 +4,19 @@ set -euo pipefail
 
 resolve_realpath() {
   local target="$1"
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$target"
-  else
-    local dir base
-    dir="$(cd "$(dirname "$target")" && pwd -P)"
-    base="$(basename "$target")"
-    printf '%s/%s\n' "$dir" "$base"
-  fi
+  local dir base link
+  while [[ -L "$target" ]]; do
+    dir="$(cd -P "$(dirname "$target")" && pwd -P)"
+    link="$(readlink "$target")"
+    if [[ "$link" == /* ]]; then
+      target="$link"
+    else
+      target="$dir/$link"
+    fi
+  done
+  dir="$(cd -P "$(dirname "$target")" && pwd -P)"
+  base="$(basename "$target")"
+  printf '%s/%s\n' "$dir" "$base"
 }
 
 SELF_REAL="$(resolve_realpath "${BASH_SOURCE[0]}")"
@@ -61,6 +66,10 @@ while [[ $# -gt 0 ]]; do
       ENABLE_VIZ=1
       shift
       ;;
+    --no-visualize-tokens)
+      ENABLE_VIZ=0
+      shift
+      ;;
     --viz-include-history|--viz-heuristic-only|--viz-preload-only)
       ENABLE_VIZ=1
       VIZ_ARGS+=("$1")
@@ -107,6 +116,20 @@ if ! REAL_AGY="$(discover_real_agy)"; then
   echo "[agy-token-viz] Error: Could not locate the underlying 'agy' CLI binary." >&2
   echo "Install Antigravity CLI or set AGY_REAL_BIN=/path/to/agy." >&2
   exit 127
+fi
+
+# Bypass visualizer for non-session CLI subcommands & help flags (helpful when `agy` is aliased to `agy --visualize-tokens`)
+if [[ "${#AGY_ARGS[@]}" -gt 0 ]]; then
+  case "${AGY_ARGS[0]}" in
+    -h|--help|--version|help|models|mcp|plugin|plugins|agent|agents|changelog|update|install|mic-serve)
+      exec "$REAL_AGY" "${AGY_ARGS[@]}"
+      ;;
+  esac
+  for a in "${AGY_ARGS[@]}"; do
+    if [[ "$a" == "-h" || "$a" == "--help" ]]; then
+      exec "$REAL_AGY" "${AGY_ARGS[@]}"
+    fi
+  done
 fi
 
 # Zero-overhead pass-through when --visualize-tokens is not requested

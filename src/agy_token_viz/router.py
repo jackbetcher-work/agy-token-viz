@@ -28,7 +28,11 @@ _LLAMA_NOOP_LOG_CB: Any = None
 
 
 def _silence_llama_cpp_logs() -> None:
-    """Prevent C-level llama.cpp / Metal init logs from writing to terminal stderr."""
+    """
+    Prevent C-level llama.cpp / Metal init logs from writing to terminal stderr,
+    and disable llama_cpp's process-wide `suppress_stdout_stderr` fd dup2 redirection
+    so background model loading never swallows PTY stdout/stderr on the main thread.
+    """
     global _LLAMA_NOOP_LOG_CB
     if _LLAMA_NOOP_LOG_CB is not None:
         return
@@ -45,6 +49,14 @@ def _silence_llama_cpp_logs() -> None:
 
         _LLAMA_NOOP_LOG_CB = _noop_cb
         llama_cpp.llama_log_set(_LLAMA_NOOP_LOG_CB, ctypes.c_void_p())
+    except Exception:
+        pass
+
+    try:
+        import llama_cpp._utils as llama_utils  # type: ignore[import-untyped]
+
+        llama_utils.suppress_stdout_stderr.__enter__ = lambda self: self
+        llama_utils.suppress_stdout_stderr.__exit__ = lambda self, *_args: None
     except Exception:
         pass
 
@@ -983,7 +995,7 @@ class OpenModelRouter:
 
 
 class AsyncStepClassifier:
-    """Background worker that warms up OpenModelRouter and classifies steps asynchronously."""
+    """Background worker that classifies steps and lazily loads OpenModelRouter on demand."""
 
     def __init__(
         self,
@@ -995,6 +1007,7 @@ class AsyncStepClassifier:
         self._router = router
         self._heuristic_only = heuristic_only or (router is None)
         self._fallback_mode = self._heuristic_only
+        self._router_loaded = False
         self._queue: queue.Queue[StepRecord | None] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._started = False
@@ -1023,16 +1036,30 @@ class AsyncStepClassifier:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
 
+    def _ensure_router_loaded(self) -> bool:
+        """Lazily initialize the local GGUF model only when an ambiguous step requires LLM inference."""
+        if self._fallback_mode or self._router is None:
+            return False
+        if self._router_loaded or getattr(self._router, "is_loaded", False):
+            self._router_loaded = True
+            return True
+        try:
+            self._router.load(status_callback=self._state.set_router_status)
+            self._router_loaded = True
+            return True
+        except Exception as exc:
+            logger.debug("Router load failed, falling back to heuristic: %s", exc)
+            self._fallback_mode = True
+            self._state.set_router_status("heuristic (offline)")
+            return False
+
     def _worker_loop(self) -> None:
         if self._heuristic_only or self._router is None:
             self._state.set_router_status("heuristic")
         else:
-            try:
-                self._router.load(status_callback=self._state.set_router_status)
-            except Exception as exc:
-                logger.debug("Router load failed, falling back to heuristic: %s", exc)
-                self._fallback_mode = True
-                self._state.set_router_status("heuristic (offline)")
+            model_spec = getattr(self._router, "model_spec", None)
+            model_name = getattr(model_spec, "name", None) or "ready"
+            self._state.set_router_status(str(model_name))
 
         while True:
             item = self._queue.get()
@@ -1043,7 +1070,13 @@ class AsyncStepClassifier:
                 if self._fallback_mode or self._router is None:
                     category = heuristic_classify(item, self._state.categories)
                 else:
-                    category = self._router.classify(item)
+                    direct, _ = resolve_tool_guardrail(item, self._state.categories)
+                    if direct is not None:
+                        category = direct
+                    elif self._ensure_router_loaded():
+                        category = self._router.classify(item)
+                    else:
+                        category = heuristic_classify(item, self._state.categories)
             except Exception as exc:
                 logger.debug("Classification error on step %s: %s", item.step_index, exc)
                 category = heuristic_classify(item, self._state.categories)

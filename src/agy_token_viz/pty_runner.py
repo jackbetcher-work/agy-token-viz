@@ -33,6 +33,25 @@ _REGION_OR_CLEAR_RE = re.compile(
     rb"\x1b\[(?:\?(?:1049|1047|47)[hl]|[012]?J|[0-9;]*r)"
 )
 
+# Track alternate screen buffer entry ('h') and exit ('l')
+_ALT_BUFFER_RE = re.compile(rb"\x1b\[\?(?:1049|1047|47)([hl])")
+
+# Child sequences that exit the alternate screen buffer or reset DECSTBM scroll margins
+_MARGIN_RESTORE_RE = re.compile(rb"\x1b\[(?:\?(?:1049|1047|47)l|[0-9;]*r)")
+
+
+def inject_scroll_region_guards(data: bytes, child_rows: int) -> bytes:
+    """
+    Immediately re-apply `DECSTBM` (`\\x1b7\\x1b[1;{child_rows}r\\x1b8`) right after any
+    sequence in `data` that exits the alternate screen buffer (`\\x1b[?1049l`) or resets
+    scroll margins (`\\x1b[...r`), before subsequent newlines in the same chunk can scroll
+    into the reserved bottom footer rows.
+    """
+    if not data or not _MARGIN_RESTORE_RE.search(data):
+        return data
+    guard = f"\x1b7\x1b[1;{max(1, child_rows)}r\x1b8".encode("ascii")
+    return _MARGIN_RESTORE_RE.sub(lambda m: m.group(0) + guard, data)
+
 
 def get_terminal_size(fd: int) -> tuple[int, int]:
     """Query `(rows, cols)` of a terminal file descriptor, defaulting to `(24, 80)` if unset."""
@@ -146,7 +165,11 @@ class PTYVisualizerRunner:
         self._use_color = should_use_color() if use_color is None else use_color
         self._min_refresh_interval = min_refresh_interval
 
-    def run(self, on_before_spawn: Callable[[], None] | None = None) -> int:
+    def run(
+        self,
+        on_before_spawn: Callable[[], None] | None = None,
+        on_process_spawn: Callable[[int], None] | None = None,
+    ) -> int:
         """Spawn `agy` and manage terminal output until exit; returns child exit code."""
         stdin_tty = os.isatty(sys.stdin.fileno())
         stdout_tty = os.isatty(sys.stdout.fileno())
@@ -156,13 +179,18 @@ class PTYVisualizerRunner:
             return self._run_non_interactive(
                 stderr_tty=stderr_tty,
                 on_before_spawn=on_before_spawn,
+                on_process_spawn=on_process_spawn,
             )
-        return self._run_pty_interactive(on_before_spawn=on_before_spawn)
+        return self._run_pty_interactive(
+            on_before_spawn=on_before_spawn,
+            on_process_spawn=on_process_spawn,
+        )
 
     def _run_non_interactive(
         self,
         stderr_tty: bool,
         on_before_spawn: Callable[[], None] | None = None,
+        on_process_spawn: Callable[[int], None] | None = None,
     ) -> int:
         """Pass stdout straight through when piped/redirected; optionally show stderr tqdm line."""
         wakeup_r, wakeup_w = os.pipe()
@@ -175,12 +203,16 @@ class PTYVisualizerRunner:
             except OSError:
                 pass
 
+        stderr_fd = os.dup(sys.stderr.fileno())
+        os.set_inheritable(stderr_fd, False)
+
         self._state.set_on_change(_notify)
         if on_before_spawn is not None:
             on_before_spawn()
 
         proc = subprocess.Popen(self._cmd)
-        stderr_fd = sys.stderr.fileno()
+        if on_process_spawn is not None:
+            on_process_spawn(proc.pid)
         drew_stderr_bar = False
 
         try:
@@ -209,6 +241,7 @@ class PTYVisualizerRunner:
             self._state.set_on_change(None)
             if drew_stderr_bar:
                 _write_all(stderr_fd, b"\r\x1b[2K")
+            os.close(stderr_fd)
             os.close(wakeup_r)
             os.close(wakeup_w)
 
@@ -237,11 +270,17 @@ class PTYVisualizerRunner:
     def _run_pty_interactive(
         self,
         on_before_spawn: Callable[[], None] | None = None,
+        on_process_spawn: Callable[[int], None] | None = None,
     ) -> int:
         stdin_fd = sys.stdin.fileno()
         stdout_fd = sys.stdout.fileno()
+        # Keep a dedicated non-inheritable duplicate of the controlling terminal fd so
+        # any library that temporarily redirects fd 1/2 (e.g. C/FFI loaders) cannot
+        # swallow PTY output on the main thread.
+        tty_out_fd = os.dup(stdout_fd)
+        os.set_inheritable(tty_out_fd, False)
 
-        rows, cols = get_terminal_size(stdout_fd)
+        rows, cols = get_terminal_size(tty_out_fd)
         use_footer = rows >= MIN_TERMINAL_ROWS_FOR_FOOTER
         child_rows = max(1, rows - BAR_ROWS) if use_footer else rows
 
@@ -254,6 +293,7 @@ class PTYVisualizerRunner:
 
         resize_flag = [False]
         state_dirty = [True]
+        in_alt_screen = False
 
         def _wake(code: bytes) -> None:
             try:
@@ -282,14 +322,14 @@ class PTYVisualizerRunner:
         # Reserve 2 clean bottom lines in normal buffer so initial prompt sits above footer
         if use_footer:
             init_seq = (
-                "\n\n\x1b[2A"  # Ensure 2 scrollable rows exist at bottom without losing history
+                "\r\n\r\n\x1b[2A"  # Ensure 2 scrollable rows exist at bottom without losing history
                 "\x1b7"
                 f"\x1b[1;{child_rows}r"
                 "\x1b8"
             ).encode("utf-8")
-            _write_all(stdout_fd, init_seq)
+            _write_all(tty_out_fd, init_seq)
             _write_all(
-                stdout_fd,
+                tty_out_fd,
                 self._build_footer_sequence(rows, cols, reapply_scroll_region=False),
             )
 
@@ -302,6 +342,8 @@ class PTYVisualizerRunner:
             start_new_session=True,
         )
         os.close(slave_fd)
+        if on_process_spawn is not None:
+            on_process_spawn(proc.pid)
 
         pending_child_bytes = b""
         last_bar_paint = time.monotonic()
@@ -326,13 +368,13 @@ class PTYVisualizerRunner:
 
                 if resize_flag[0]:
                     resize_flag[0] = False
-                    rows, cols = get_terminal_size(stdout_fd)
+                    rows, cols = get_terminal_size(tty_out_fd)
                     use_footer = rows >= MIN_TERMINAL_ROWS_FOR_FOOTER
                     child_rows = max(1, rows - BAR_ROWS) if use_footer else rows
                     set_pty_winsize(master_fd, child_rows, cols)
-                    if use_footer:
+                    if use_footer and not in_alt_screen:
                         _write_all(
-                            stdout_fd,
+                            tty_out_fd,
                             self._build_footer_sequence(
                                 rows, cols, reapply_scroll_region=True
                             ),
@@ -359,43 +401,64 @@ class PTYVisualizerRunner:
                     if not chunk:
                         # Child closed PTY slave
                         if pending_child_bytes:
-                            _write_all(stdout_fd, pending_child_bytes)
+                            _write_all(tty_out_fd, pending_child_bytes)
                             pending_child_bytes = b""
                         break
+
+                    # Coalesce immediately available PTY bytes so single child frames
+                    # larger than the 1024-byte kernel PTY buffer are processed together.
+                    while len(chunk) < 65536:
+                        try:
+                            more, _, _ = select.select([master_fd], [], [], 0)
+                            if not more:
+                                break
+                            extra = os.read(master_fd, 16384)
+                            if not extra:
+                                break
+                            chunk += extra
+                        except OSError:
+                            break
 
                     combined = pending_child_bytes + chunk
                     complete, pending_child_bytes = split_complete_terminal_bytes(combined)
                     if complete:
                         if use_footer:
-                            needs_region = bool(_REGION_OR_CLEAR_RE.search(complete))
-                            now = time.monotonic()
-                            if needs_region or (
-                                state_dirty[0]
-                                and (now - last_bar_paint) >= self._min_refresh_interval
-                            ):
-                                footer = self._build_footer_sequence(
-                                    rows,
-                                    cols,
-                                    reapply_scroll_region=needs_region,
-                                )
-                                _write_all(stdout_fd, complete + footer)
-                                last_bar_paint = now
-                                state_dirty[0] = False
+                            for match in _ALT_BUFFER_RE.finditer(complete):
+                                in_alt_screen = match.group(1) == b"h"
+                            guarded = inject_scroll_region_guards(complete, child_rows)
+                            if not in_alt_screen:
+                                needs_region = bool(_REGION_OR_CLEAR_RE.search(complete))
+                                now = time.monotonic()
+                                if needs_region or (
+                                    state_dirty[0]
+                                    and (now - last_bar_paint) >= self._min_refresh_interval
+                                ):
+                                    footer = self._build_footer_sequence(
+                                        rows,
+                                        cols,
+                                        reapply_scroll_region=needs_region,
+                                    )
+                                    _write_all(tty_out_fd, guarded + footer)
+                                    last_bar_paint = now
+                                    state_dirty[0] = False
+                                else:
+                                    _write_all(tty_out_fd, guarded)
                             else:
-                                _write_all(stdout_fd, complete)
+                                _write_all(tty_out_fd, guarded)
                         else:
-                            _write_all(stdout_fd, complete)
+                            _write_all(tty_out_fd, complete)
 
                 # Periodic/idle repaint when background router finishes classifying a step
                 now = time.monotonic()
                 if (
                     use_footer
+                    and not in_alt_screen
                     and state_dirty[0]
                     and not pending_child_bytes
                     and (now - last_bar_paint) >= self._min_refresh_interval
                 ):
                     _write_all(
-                        stdout_fd,
+                        tty_out_fd,
                         self._build_footer_sequence(
                             rows, cols, reapply_scroll_region=False
                         ),
@@ -413,7 +476,7 @@ class PTYVisualizerRunner:
                             tail = os.read(master_fd, 16384)
                             if not tail:
                                 break
-                            _write_all(stdout_fd, tail)
+                            _write_all(tty_out_fd, tail)
                         except OSError:
                             break
                     break
@@ -427,7 +490,7 @@ class PTYVisualizerRunner:
                 pass
 
             if use_footer:
-                rows, _ = get_terminal_size(stdout_fd)
+                rows, _ = get_terminal_size(tty_out_fd)
                 # Clear the 2 pinned footer lines, reset DECSTBM margins, place cursor cleanly
                 cleanup_seq = (
                     "\x1b7"
@@ -436,12 +499,13 @@ class PTYVisualizerRunner:
                     "\x1b[r"
                     "\x1b8\r\n"
                 ).encode("utf-8")
-                _write_all(stdout_fd, cleanup_seq)
+                _write_all(tty_out_fd, cleanup_seq)
 
             try:
                 os.close(master_fd)
             except OSError:
                 pass
+            os.close(tty_out_fd)
             os.close(wakeup_r)
             os.close(wakeup_w)
 

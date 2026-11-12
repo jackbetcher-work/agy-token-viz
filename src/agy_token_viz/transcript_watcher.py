@@ -5,11 +5,22 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import re
 import threading
 from typing import Any, Callable, Sequence
 
 from agy_token_viz.state import StepRecord, ToolCallSummary
 from agy_token_viz.tokenizer import count_tokens_locally, serialize_tool_calls_verbatim
+
+
+_UUID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+_UUID_RE = re.compile(_UUID_PATTERN)
+_CLI_LOG_CREATED_CONV_RE = re.compile(rf"\bCreated conversation ({_UUID_PATTERN})\b")
+_CLI_LOG_ATTACHED_CONV_RE = re.compile(
+    rf"\b(?:Streaming conversation|Starting conversation update stream for|"
+    rf"Forwarding user message to conversation|Sending user message to conversation|"
+    rf"Full redraw completed \(RerenderAll\) for conversation)\s+({_UUID_PATTERN})\b"
+)
 
 
 def extract_target_conversation_from_args(agy_args: Sequence[str]) -> str | None:
@@ -22,6 +33,27 @@ def extract_target_conversation_from_args(agy_args: Sequence[str]) -> str | None
         if token.startswith("--conversation="):
             val = token.split("=", 1)[1].strip()
             return val or None
+    return None
+
+
+def is_resuming_conversation_from_args(agy_args: Sequence[str]) -> bool:
+    """Return True if forwarded `agy` CLI flags resume an existing conversation (`-c`, `--continue`, `--conversation`)."""
+    for token in agy_args:
+        if token in ("-c", "--continue", "--conversation") or token.startswith("--conversation="):
+            return True
+    return False
+
+
+def extract_log_file_from_args(agy_args: Sequence[str]) -> Path | None:
+    """Inspect forwarded `agy` CLI flags for an explicit `--log-file <path>` override."""
+    args = list(agy_args)
+    for idx, token in enumerate(args):
+        if token == "--log-file" and idx + 1 < len(args):
+            val = args[idx + 1].strip()
+            return Path(val).expanduser() if val else None
+        if token.startswith("--log-file="):
+            val = token.split("=", 1)[1].strip()
+            return Path(val).expanduser() if val else None
     return None
 
 
@@ -246,52 +278,238 @@ class TranscriptWatcher:
         target_conversation_id: str | None = None,
         include_history: bool = False,
         poll_interval: float = 0.15,
+        *,
+        exclude_preexisting: bool = False,
+        lock_to_first_conversation: bool = False,
+        on_baseline_context: Callable[[str, int, int, int], None] | None = None,
+        on_reset: Callable[[], None] | None = None,
+        explicit_log_file: Path | None = None,
     ) -> None:
-        self._brain_dir = agy_data_dir.expanduser() / "brain"
+        self._agy_data_dir = agy_data_dir.expanduser()
+        self._brain_dir = self._agy_data_dir / "brain"
+        self._log_dir = self._agy_data_dir / "log"
         self._on_step = on_step
         self._target_conversation_id = target_conversation_id
         self._allowed_conversations: set[str] = (
             {target_conversation_id} if target_conversation_id else set()
         )
+        self._subagent_conversations: set[str] = set()
+        self._preexisting_conversations: set[str] = set()
+        self._excluded_conversations: set[str] = set()
+        self._rewound_history_conversations: set[str] = set()
+        self._active_primary_conversation: str | None = target_conversation_id
         self._include_history = include_history
         self._poll_interval = poll_interval
+        self._exclude_preexisting = exclude_preexisting
+        self._lock_to_first_conversation = lock_to_first_conversation
+        self._on_baseline_context = on_baseline_context
+        self._on_reset = on_reset
+        self._explicit_log_file = explicit_log_file
+
+        self._child_pid: int | None = None
+        self._cli_log_path: Path | None = None
+        self._cli_log_offset: int = 0
 
         self._cursors: dict[Path, _FileCursor] = {}
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._baseline_captured = False
 
+    def set_child_pid(self, pid: int) -> None:
+        """Bind watcher to the spawned `agy` child process PID to track its CLI log."""
+        if pid > 0:
+            self._child_pid = pid
+
     def capture_baseline(self) -> None:
         """
         Snapshot existing transcript file byte offsets BEFORE spawning `agy`.
 
         This guarantees:
+        - Fresh `agy` runs (`exclude_preexisting=True`) ignore pre-existing conversations
+          (including sessions actively running in other terminals) unless explicitly
+          attached to by this `agy` process in its CLI log.
         - `--continue` or resumed conversations only tally NEW steps generated in this run
-          (unless `include_history=True`).
+          (unless `include_history=True`) while seeding pre-session context size so
+          uncached prefix-cache tails from prior runs are not re-billed as new input.
         - Newly created conversations start at byte offset 0.
         """
         self._baseline_captured = True
         if not self._brain_dir.is_dir():
             return
 
-        for transcript_path in self._iter_transcript_paths():
-            conv_id = self._conversation_id_for(transcript_path)
-            if self._include_history and (
-                self._target_conversation_id is None
-                or conv_id == self._target_conversation_id
-            ):
-                offset = 0
-                line_count = 0
-            else:
-                offset, line_count = self._measure_complete_lines(transcript_path)
+        try:
+            for child in self._brain_dir.iterdir():
+                if child.is_dir():
+                    self._preexisting_conversations.add(child.name)
+        except OSError:
+            pass
 
-            self._cursors[transcript_path] = _FileCursor(
+        if self._exclude_preexisting and self._target_conversation_id is None:
+            self._excluded_conversations.update(self._preexisting_conversations)
+            return
+
+        if self._target_conversation_id is not None:
+            target_path = self._transcript_path_for(self._target_conversation_id)
+            transcript_paths = [target_path] if target_path.is_file() else []
+            if target_path.is_file():
+                self._preexisting_conversations.add(self._target_conversation_id)
+        else:
+            transcript_paths = self._iter_transcript_paths()
+            for transcript_path in transcript_paths:
+                conv_id = self._conversation_id_for(transcript_path)
+                self._preexisting_conversations.add(conv_id)
+
+        # When include_history=True without an explicit target_conversation_id, only replay
+        # the most recently modified transcript at baseline (not every historical session).
+        most_recent_path: Path | None = None
+        if (
+            self._include_history
+            and self._target_conversation_id is None
+            and not self._exclude_preexisting
+            and transcript_paths
+        ):
+            try:
+                most_recent_path = max(
+                    transcript_paths,
+                    key=lambda p: p.stat().st_mtime,
+                )
+            except OSError:
+                most_recent_path = transcript_paths[-1]
+
+        for transcript_path in transcript_paths:
+            conv_id = self._conversation_id_for(transcript_path)
+            replay_from_start = False
+            if self._include_history:
+                if self._target_conversation_id is not None:
+                    replay_from_start = conv_id == self._target_conversation_id
+                elif not self._exclude_preexisting and transcript_path == most_recent_path:
+                    replay_from_start = True
+
+            if replay_from_start:
+                self._rewound_history_conversations.add(conv_id)
+                self._cursors[transcript_path] = _FileCursor(
+                    conversation_id=conv_id,
+                    path=transcript_path,
+                    full_path=transcript_path.with_name("transcript_full.jsonl"),
+                    byte_offset=0,
+                    line_index=0,
+                )
+            else:
+                cursor = self._inspect_existing_transcript(transcript_path, conv_id)
+                self._cursors[transcript_path] = cursor
+
+    def _inspect_existing_transcript(self, path: Path, conv_id: str) -> _FileCursor:
+        """Measure complete lines at EOF and extract prior context baseline for resumed sessions."""
+        full_path = path.with_name("transcript_full.jsonl")
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return _FileCursor(
                 conversation_id=conv_id,
-                path=transcript_path,
-                full_path=transcript_path.with_name("transcript_full.jsonl"),
-                byte_offset=offset,
-                line_index=line_count,
+                path=path,
+                full_path=full_path,
+                byte_offset=0,
+                line_index=0,
             )
+
+        last_nl = data.rfind(b"\n")
+        if last_nl == -1:
+            return _FileCursor(
+                conversation_id=conv_id,
+                path=path,
+                full_path=full_path,
+                byte_offset=0,
+                line_index=0,
+            )
+
+        consumed = data[: last_nl + 1]
+        offset = len(consumed)
+        lines = consumed.decode("utf-8", errors="replace").splitlines()
+        line_count = len(lines)
+
+        saw_user_input = False
+        saw_planner_step = False
+        saw_checkpoint = False
+        last_user_input = ""
+        pending_payload_parts: list[str] = []
+        last_planner_obj: dict[str, Any] | None = None
+        last_planner_line_idx: int = -1
+
+        # Scan backwards from EOF to locate the most recent completed PLANNER_RESPONSE
+        # without JSON-parsing earlier historical turns that would be overwritten.
+        for idx in range(line_count - 1, -1, -1):
+            stripped = lines[idx].strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("type") == "PLANNER_RESPONSE" and obj.get("status") in (None, "DONE"):
+                saw_planner_step = True
+                last_planner_obj = obj
+                last_planner_line_idx = idx
+                break
+
+        # Process only the trailing events after the last completed PLANNER_RESPONSE
+        for idx in range(last_planner_line_idx + 1, line_count):
+            stripped = lines[idx].strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+
+            entry_type = obj.get("type")
+            if entry_type == "CHECKPOINT":
+                saw_checkpoint = True
+                pending_payload_parts.clear()
+            elif entry_type == "USER_INPUT":
+                saw_user_input = True
+                text = str(obj.get("content") or "")
+                last_user_input = text
+                if text:
+                    pending_payload_parts.append(text)
+            elif entry_type in ("GENERIC", "SYSTEM_MESSAGE", "ERROR_MESSAGE"):
+                if obj.get("status") in (None, "DONE", "ERROR"):
+                    text = str(obj.get("content") or "")
+                    if text:
+                        pending_payload_parts.append(text)
+
+        if saw_planner_step and last_planner_obj is not None and self._on_baseline_context is not None:
+            if last_planner_obj.get("truncated_fields") and last_planner_line_idx >= 0:
+                full_line = _read_specific_line(full_path, last_planner_line_idx)
+                if full_line:
+                    try:
+                        hydrated = json.loads(full_line)
+                        if isinstance(hydrated, dict):
+                            last_planner_obj = hydrated
+                    except json.JSONDecodeError:
+                        pass
+            last_step = parse_planner_step(last_planner_obj, conv_id)
+            if last_step is not None:
+                prompt_tok = max(0, last_step.cache_read_tokens) + max(0, last_step.input_tokens)
+                vis_end = prompt_tok + last_step.visible_output_tokens
+                end_ctx = prompt_tok + max(0, last_step.output_tokens)
+                self._on_baseline_context(conv_id, prompt_tok, vis_end, end_ctx)
+
+        return _FileCursor(
+            conversation_id=conv_id,
+            path=path,
+            full_path=full_path,
+            byte_offset=offset,
+            line_index=line_count,
+            saw_user_input=saw_user_input,
+            saw_planner_step=saw_planner_step,
+            saw_checkpoint=saw_checkpoint,
+            last_user_input=last_user_input,
+            pending_payload_parts=pending_payload_parts,
+        )
 
     def start(self) -> None:
         if not self._baseline_captured:
@@ -317,19 +535,156 @@ class TranscriptWatcher:
             self.poll_once()
             self._stop_event.wait(self._poll_interval)
 
+    def _discover_cli_log_for_pid(self, pid: int) -> Path | None:
+        """Locate the `cli-*.log` file created by our spawned `agy` child process `pid`."""
+        if self._explicit_log_file is not None and self._explicit_log_file.is_file():
+            return self._explicit_log_file
+
+        if not self._log_dir.is_dir():
+            return None
+
+        pid_pattern = re.compile(rf"\bStarting language server process with pid {pid}\b")
+        try:
+            candidates = sorted(
+                self._log_dir.glob("cli-*.log"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )[:8]
+        except OSError:
+            return None
+
+        for cand in candidates:
+            try:
+                with cand.open("rb") as fh:
+                    head = fh.read(512).decode("utf-8", errors="replace")
+            except OSError:
+                continue
+            if pid_pattern.search(head):
+                return cand
+        return None
+
+    def _sync_cli_log(self) -> None:
+        """Tail the child `agy` process's CLI log to bind strictly to its active conversation(s)."""
+        if self._cli_log_path is None and self._child_pid is not None:
+            found = self._discover_cli_log_for_pid(self._child_pid)
+            if found is not None:
+                self._cli_log_path = found
+                self._cli_log_offset = 0
+
+        if self._cli_log_path is None:
+            return
+
+        try:
+            with self._cli_log_path.open("rb") as fh:
+                fh.seek(self._cli_log_offset)
+                chunk = fh.read()
+        except OSError:
+            return
+
+        if not chunk:
+            return
+
+        last_nl = chunk.rfind(b"\n")
+        if last_nl == -1:
+            return
+
+        complete = chunk[: last_nl + 1]
+        self._cli_log_offset += len(complete)
+
+        for line in complete.decode("utf-8", errors="replace").splitlines():
+            created_match = _CLI_LOG_CREATED_CONV_RE.search(line)
+            if created_match:
+                conv_id = created_match.group(1)
+                if (
+                    self._active_primary_conversation is not None
+                    and conv_id != self._active_primary_conversation
+                    and conv_id not in self._subagent_conversations
+                ):
+                    # User started a brand-new conversation interactively (e.g., `/new`)
+                    if self._on_reset is not None:
+                        self._on_reset()
+                    self._allowed_conversations = {conv_id}
+                    self._subagent_conversations.clear()
+                else:
+                    self._allowed_conversations.add(conv_id)
+                self._active_primary_conversation = conv_id
+                self._excluded_conversations.discard(conv_id)
+                continue
+
+            attached_match = _CLI_LOG_ATTACHED_CONV_RE.search(line)
+            if attached_match:
+                conv_id = attached_match.group(1)
+                if self._active_primary_conversation is None:
+                    self._active_primary_conversation = conv_id
+                    self._allowed_conversations.add(conv_id)
+                elif (
+                    conv_id != self._active_primary_conversation
+                    and conv_id not in self._allowed_conversations
+                    and conv_id not in self._subagent_conversations
+                ):
+                    # User switched to / resumed a different conversation interactively
+                    if self._on_reset is not None:
+                        self._on_reset()
+                    self._allowed_conversations = {conv_id}
+                    self._subagent_conversations.clear()
+                    self._active_primary_conversation = conv_id
+                else:
+                    self._allowed_conversations.add(conv_id)
+                self._excluded_conversations.discard(conv_id)
+
+                transcript_path = self._transcript_path_for(conv_id)
+                if (
+                    conv_id in self._preexisting_conversations
+                    and not self._include_history
+                    and transcript_path not in self._cursors
+                    and transcript_path.is_file()
+                ):
+                    self._cursors[transcript_path] = self._inspect_existing_transcript(
+                        transcript_path, conv_id
+                    )
+
+                if self._include_history and conv_id not in self._rewound_history_conversations:
+                    self._rewound_history_conversations.add(conv_id)
+                    for cur in self._cursors.values():
+                        if cur.conversation_id == conv_id and cur.byte_offset > 0:
+                            cur.byte_offset = 0
+                            cur.line_index = 0
+                            cur.saw_user_input = False
+                            cur.saw_planner_step = False
+                            cur.saw_checkpoint = False
+                            cur.last_user_input = ""
+                            cur.pending_payload_parts.clear()
+
     def poll_once(self) -> int:
         """Scan for new complete JSONL lines across tracked/newly created transcripts."""
+        self._sync_cli_log()
+
         if not self._brain_dir.is_dir():
             return 0
 
+        if self._cli_log_path is not None or self._allowed_conversations:
+            # Fast path: check only bound/allowed conversations without globbing brain/*
+            transcript_paths = [
+                p
+                for conv_id in sorted(self._allowed_conversations)
+                if (p := self._transcript_path_for(conv_id)).is_file()
+            ]
+        else:
+            transcript_paths = self._iter_transcript_paths()
+
         emitted = 0
-        for transcript_path in self._iter_transcript_paths():
+        for transcript_path in transcript_paths:
             conv_id = self._conversation_id_for(transcript_path)
-            if (
-                self._target_conversation_id is not None
-                and conv_id not in self._allowed_conversations
-            ):
-                continue
+
+            if self._cli_log_path is not None:
+                # Strictly bound to conversations owned by our spawned `agy` process
+                if conv_id not in self._allowed_conversations:
+                    continue
+            else:
+                if conv_id in self._excluded_conversations:
+                    continue
+                if self._allowed_conversations and conv_id not in self._allowed_conversations:
+                    continue
 
             cursor = self._cursors.get(transcript_path)
             if cursor is None:
@@ -408,8 +763,8 @@ class TranscriptWatcher:
                     except json.JSONDecodeError:
                         pass
 
-            # Track spawned subagent conversation IDs when targeting a specific parent session
-            self._discover_subagents(obj)
+            # Track spawned subagent conversation IDs for the active session
+            self._discover_subagents(obj, cursor.conversation_id)
 
             entry_type = obj.get("type")
             if entry_type == "CHECKPOINT":
@@ -446,24 +801,39 @@ class TranscriptWatcher:
                 cursor.saw_planner_step = True
                 cursor.saw_checkpoint = False
                 cursor.pending_payload_parts.clear()
+                if self._lock_to_first_conversation and not self._allowed_conversations:
+                    self._active_primary_conversation = cursor.conversation_id
+                    self._allowed_conversations.add(cursor.conversation_id)
                 self._on_step(step)
                 emitted += 1
 
         return emitted
 
-    def _discover_subagents(self, obj: dict[str, Any]) -> None:
-        if self._target_conversation_id is None:
+    def _discover_subagents(self, obj: dict[str, Any], parent_conv_id: str) -> None:
+        if (
+            self._target_conversation_id is None
+            and not self._lock_to_first_conversation
+            and not self._allowed_conversations
+        ):
             return
         content = obj.get("content")
         if isinstance(content, str) and "conversationId" in content:
-            # Extract UUID-like conversation IDs returned by invoke_subagent
-            import re
-
-            for match in re.findall(
-                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-                content,
-            ):
+            for match in _UUID_RE.findall(content):
+                if self._lock_to_first_conversation and not self._allowed_conversations:
+                    self._active_primary_conversation = parent_conv_id
+                    self._allowed_conversations.add(parent_conv_id)
+                self._subagent_conversations.add(match)
                 self._allowed_conversations.add(match)
+                self._excluded_conversations.discard(match)
+
+    def _transcript_path_for(self, conv_id: str) -> Path:
+        return (
+            self._brain_dir
+            / conv_id
+            / ".system_generated"
+            / "logs"
+            / "transcript.jsonl"
+        )
 
     def _iter_transcript_paths(self) -> list[Path]:
         try:
