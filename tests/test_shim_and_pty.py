@@ -6,14 +6,19 @@ import os
 from pathlib import Path
 import pty
 import select
+import signal
 import stat
 import subprocess
 import time
 
 from agy_token_viz.pty_runner import (
     PTYVisualizerRunner,
+    build_resize_transition_sequence,
+    clamp_child_cursor_positions,
+    erase_normal_footer_before_alt_screen,
     filter_footer_mouse_events,
     inject_scroll_region_guards,
+    rewrite_terminal_input_events,
     set_pty_winsize,
     split_complete_terminal_bytes,
 )
@@ -694,6 +699,45 @@ class _MiniVT100:
     def _blank_grid(self) -> list[list[str]]:
         return [[" "] * self.cols for _ in range(self.rows)]
 
+    def snapshot_lines(self) -> list[str]:
+        return ["".join(r).rstrip() for r in self.grid]
+
+    def resize(self, new_rows: int, new_cols: int) -> None:
+        """Resize terminal grid like xterm/Terminal.app/iTerm2 (resets DECSTBM to full screen)."""
+        in_alt = self.grid is self.alt_grid
+
+        def _resize_grid(old: list[list[str]]) -> list[list[str]]:
+            out = [[" "] * new_cols for _ in range(new_rows)]
+            copy_r = min(len(old), new_rows)
+            for r in range(copy_r):
+                copy_c = min(len(old[r]), new_cols)
+                out[r][:copy_c] = old[r][:copy_c]
+            return out
+
+        self.norm_grid = _resize_grid(self.norm_grid)
+        self.alt_grid = _resize_grid(self.alt_grid)
+        self.grid = self.alt_grid if in_alt else self.norm_grid
+        self.rows = new_rows
+        self.cols = new_cols
+        self.row = max(0, min(new_rows - 1, self.row))
+        self.col = max(0, min(new_cols - 1, self.col))
+        self.pending_wrap = False
+        # Real terminal emulators reset DECSTBM margins to 1..new_rows on window resize
+        self.scroll_top = 0
+        self.scroll_bottom = new_rows - 1
+        sr, sc, _ = self._saved_cursor
+        self._saved_cursor = (
+            max(0, min(new_rows - 1, sr)),
+            max(0, min(new_cols - 1, sc)),
+            False,
+        )
+        ar, ac, _ = self._alt_saved_cursor
+        self._alt_saved_cursor = (
+            max(0, min(new_rows - 1, ar)),
+            max(0, min(new_cols - 1, ac)),
+            False,
+        )
+
     def _scroll_up(self, count: int) -> None:
         span = self.scroll_bottom - self.scroll_top + 1
         n = max(0, min(count, span))
@@ -726,6 +770,14 @@ class _MiniVT100:
                     continue
                 if nxt == "8":
                     self.row, self.col, self.pending_wrap = self._saved_cursor
+                    i += 2
+                    continue
+                if nxt == "D":
+                    self.pending_wrap = False
+                    if self.row == self.scroll_bottom:
+                        self._scroll_up(1)
+                    elif self.row < self.rows - 1:
+                        self.row += 1
                     i += 2
                     continue
                 if nxt == "M":
@@ -799,8 +851,23 @@ class _MiniVT100:
             self.row = max(0, min(self.rows - 1, (p0 or 1) - 1))
             self.col = max(0, min(self.cols - 1, (p1 or 1) - 1))
             self.pending_wrap = False
+        elif final == "d":
+            self.row = max(0, min(self.rows - 1, (p0 or 1) - 1))
+            self.pending_wrap = False
+        elif final == "G":
+            self.col = max(0, min(self.cols - 1, (p0 or 1) - 1))
+            self.pending_wrap = False
         elif final == "A":
             self.row = max(0, self.row - (p0 or 1))
+            self.pending_wrap = False
+        elif final == "B":
+            self.row = min(self.rows - 1, self.row + (p0 or 1))
+            self.pending_wrap = False
+        elif final == "C":
+            self.col = min(self.cols - 1, self.col + (p0 or 1))
+            self.pending_wrap = False
+        elif final == "D":
+            self.col = max(0, self.col - (p0 or 1))
             self.pending_wrap = False
         elif final == "J":
             self.pending_wrap = False
@@ -1001,6 +1068,1053 @@ sys.stdout.flush()
     assert "Tokens" in snap[28]
     assert "In:" in snap[28] or "I:" in snap[28]
     assert snap[29] != ""
+
+
+def test_build_resize_transition_sequence_clears_stale_and_newly_exposed_rows() -> None:
+    # 1. Expanding (24 -> 54): prev_child_rows = 22, new_child_rows = 52 -> clear from row 23 down
+    assert (
+        build_resize_transition_sequence(
+            prev_rows=24,
+            prev_use_footer=True,
+            new_rows=54,
+            new_use_footer=True,
+        )
+        == b"\x1b7\x1b[0m\x1b[1;52r\x1b[23;1H\x1b[J\x1b8"
+    )
+
+    # 2. Shrinking (54 -> 24): prev_child_rows = 52, new_child_rows = 22 -> clear from row 23 down
+    assert (
+        build_resize_transition_sequence(
+            prev_rows=54,
+            prev_use_footer=True,
+            new_rows=24,
+            new_use_footer=True,
+        )
+        == b"\x1b7\x1b[0m\x1b[1;22r\x1b[23;1H\x1b[J\x1b8"
+    )
+
+    # 3. Width-only resize (54 -> 54): clear reserved footer band 53..54
+    assert (
+        build_resize_transition_sequence(
+            prev_rows=54,
+            prev_use_footer=True,
+            new_rows=54,
+            new_use_footer=True,
+        )
+        == b"\x1b7\x1b[0m\x1b[1;52r\x1b[53;1H\x1b[J\x1b8"
+    )
+
+    # 4. Shrinking across MIN_TERMINAL_ROWS_FOR_FOOTER (6 -> 5): prev_child_rows = 4 -> clear row 5 & reset margins
+    assert (
+        build_resize_transition_sequence(
+            prev_rows=6,
+            prev_use_footer=True,
+            new_rows=5,
+            new_use_footer=False,
+        )
+        == b"\x1b7\x1b[0m\x1b[r\x1b[5;1H\x1b[J\x1b8"
+    )
+
+    # 5. Shrinking from 24 -> 4: old footer at 23..24 was clipped; reset margins without erasing 1..4
+    assert (
+        build_resize_transition_sequence(
+            prev_rows=24,
+            prev_use_footer=True,
+            new_rows=4,
+            new_use_footer=False,
+        )
+        == b"\x1b7\x1b[0m\x1b[r\x1b8"
+    )
+
+    # 6. Expanding from < 6 rows to >= 6 rows (4 -> 24): clear newly exposed 5..24 & set 1..22 margins
+    assert (
+        build_resize_transition_sequence(
+            prev_rows=4,
+            prev_use_footer=False,
+            new_rows=24,
+            new_use_footer=True,
+        )
+        == b"\x1b7\x1b[0m\x1b[1;22r\x1b[5;1H\x1b[J\x1b8"
+    )
+
+    # 7. Tiny -> tiny (4 -> 5): no-op
+    assert (
+        build_resize_transition_sequence(
+            prev_rows=4,
+            prev_use_footer=False,
+            new_rows=5,
+            new_use_footer=False,
+        )
+        == b""
+    )
+
+
+def test_double_click_fullscreen_resize_animation_never_duplicates_bars_or_blocks_prompt(
+    tmp_path: Path,
+) -> None:
+    """
+    End-to-end regression test reproducing the macOS double-click terminal full-screen bug:
+    - Child TUI uses an Ultraviolet-style diff renderer (`curbuf`) that resizes `curbuf` by
+      padding newly exposed rows/cols with `' '` and ONLY emits non-matching cells (never
+      emitting `\\x1b[2J` on resize, so any stale token bar cells inside `1..child_rows` or
+      inside the prompt box's blank interior would remain permanently visible).
+    - Simulates:
+      1. Initial `24x80` render (`child_rows=22`, prompt box on rows `17..22`, footer on `23..24`).
+      2. Rapid 10-step double-click full-screen zoom animation (`24x80 -> ... -> 54x140`).
+      3. Post-settle incremental expand (`54x140 -> 60x150`) where the new prompt box (`53..58`)
+         lands directly on the exact rows (`53..54`) previously occupied by the settled footer.
+      4. Rapid double-click restore/shrink animation (`60x150 -> ... -> 24x80`).
+    """
+    fake_diff_tui = tmp_path / "fake_diff_tui"
+    fake_diff_tui.write_text(
+        """#!/usr/bin/env python3
+import fcntl, json, os, pathlib, select, signal, struct, sys, termios
+
+data_dir = os.environ.get("JETSKI_DATA_DIR")
+if data_dir:
+    logs = pathlib.Path(data_dir) / "brain" / "resize-conv-001" / ".system_generated" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    step = {
+        "step_index": 1,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "input_tokens": 3500,
+        "cache_read_tokens": 9000,
+        "output_tokens": 600,
+        "thinking": "Inspecting workspace files",
+        "tool_calls": [{"name": "read_file", "args": {"Path": "README.md"}}],
+    }
+    (logs / "transcript.jsonl").write_text(json.dumps(step) + "\\n", encoding="utf-8")
+
+wake_r, wake_w = os.pipe()
+os.set_blocking(wake_r, False)
+os.set_blocking(wake_w, False)
+resized = [True]
+
+def _on_winch(_s, _f):
+    resized[0] = True
+    try:
+        os.write(wake_w, b"W")
+    except OSError:
+        pass
+
+signal.signal(signal.SIGWINCH, _on_winch)
+
+def _winsize():
+    packed = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0))
+    r, c, _, _ = struct.unpack("HHHH", packed)
+    return max(6, r), max(20, c)
+
+curbuf = []
+
+def _resize_curbuf(rows, cols):
+    global curbuf
+    new_cur = [[" "] * cols for _ in range(rows)]
+    for r in range(min(len(curbuf), rows)):
+        copy_c = min(len(curbuf[r]), cols)
+        new_cur[r][:copy_c] = curbuf[r][:copy_c]
+    curbuf = new_cur
+
+def _render_frame():
+    rows, cols = _winsize()
+    _resize_curbuf(rows, cols)
+    nextbuf = [[" "] * cols for _ in range(rows)]
+
+    def _put_line(r_idx, text):
+        if 0 <= r_idx < rows:
+            for c_idx, ch in enumerate(text[:cols]):
+                nextbuf[r_idx][c_idx] = ch
+
+    _put_line(0, f"READY_{rows}x{cols} - Antigravity / Jetski TUI")
+    _put_line(1, "Assistant: Ready to help with your project.")
+
+    box_w = max(20, cols - 2)
+    top_border = "┌" + ("─" * (box_w - 2)) + "┐"
+    prompt_txt = "> Type your prompt here..."
+    prompt_line = "│ " + prompt_txt + (" " * max(0, box_w - 3 - len(prompt_txt))) + "│"
+    empty_line = "│" + (" " * (box_w - 2)) + "│"
+    hint_txt = "[Enter to send]"
+    hint_line = "│ " + hint_txt + (" " * max(0, box_w - 3 - len(hint_txt))) + "│"
+    bot_border = "└" + ("─" * (box_w - 2)) + "┘"
+    status_line = f"  gemini-2.5-pro · {rows}x{cols}"
+
+    prompt_block = [top_border, prompt_line, empty_line, hint_line, bot_border, status_line]
+    start_row = max(2, rows - len(prompt_block))
+    for offset, line in enumerate(prompt_block):
+        _put_line(start_row + offset, line)
+
+    # Diff-flush ONLY cells that changed relative to `curbuf` (no \\x1b[2J on resize!)
+    out = ["\\x1b[?2026h"]
+    for r in range(rows):
+        c = 0
+        while c < cols:
+            if nextbuf[r][c] != curbuf[r][c]:
+                start_c = c
+                chars = []
+                while c < cols and nextbuf[r][c] != curbuf[r][c]:
+                    chars.append(nextbuf[r][c])
+                    curbuf[r][c] = nextbuf[r][c]
+                    c += 1
+                out.append(f"\\x1b[{r + 1};{start_c + 1}H" + "".join(chars))
+            else:
+                c += 1
+    out.append("\\x1b[?2026l")
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+sys.stdout.write("\\x1b[?1049h\\x1b[H\\x1b[2J")
+sys.stdout.flush()
+
+while True:
+    if resized[0]:
+        resized[0] = False
+        _render_frame()
+    try:
+        rlist, _, _ = select.select([sys.stdin.fileno(), wake_r], [], [], 0.2)
+    except InterruptedError:
+        continue
+    if wake_r in rlist:
+        try:
+            os.read(wake_r, 1024)
+        except OSError:
+            pass
+    if sys.stdin.fileno() in rlist:
+        data = os.read(sys.stdin.fileno(), 64)
+        if not data or b"q" in data:
+            break
+
+sys.stdout.write("\\x1b[?1049l")
+sys.stdout.flush()
+""",
+        encoding="utf-8",
+    )
+    fake_diff_tui.chmod(fake_diff_tui.stat().st_mode | stat.S_IXUSR)
+
+    master_fd, slave_fd = pty.openpty()
+    set_pty_winsize(slave_fd, 24, 80)
+    vt = _MiniVT100(rows=24, cols=80)
+
+    env = {
+        **os.environ,
+        "JETSKI_REAL_BIN": str(fake_diff_tui),
+        "JETSKI_DATA_DIR": str(tmp_path / "jetski_resize_data"),
+        "TERM": "xterm-256color",
+    }
+    proc = subprocess.Popen(
+        [str(BIN_JETSKI), "--visualize-tokens", "--viz-heuristic-only"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+
+    def _drain_into_vt(duration: float) -> None:
+        end_at = time.monotonic() + duration
+        while True:
+            rem = end_at - time.monotonic()
+            if rem <= 0:
+                break
+            ready, _, _ = select.select([master_fd], [], [], min(0.02, rem))
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 16384)
+                    if chunk:
+                        vt.feed(chunk)
+                except OSError:
+                    break
+
+    def _wait_for_settled_screen(expected_child_rows: int, expected_cols: int) -> list[str]:
+        marker = f"READY_{expected_child_rows}x{expected_cols}"
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            _drain_into_vt(0.03)
+            lines = vt.snapshot_lines()
+            if (
+                len(lines) == expected_child_rows + 2
+                and marker in lines[0]
+                and "Tokens" in lines[expected_child_rows]
+                and "Explore" in lines[expected_child_rows + 1]
+            ):
+                return lines
+        raise AssertionError(
+            f"Timed out waiting for {marker} + settled footer; screen:\n"
+            + "\n".join(f"{i + 1:02d}: {l}" for i, l in enumerate(vt.snapshot_lines()))
+        )
+
+    def _apply_resize_step(new_rows: int, new_cols: int) -> None:
+        vt.resize(new_rows, new_cols)
+        set_pty_winsize(master_fd, new_rows, new_cols)
+        os.kill(proc.pid, signal.SIGWINCH)
+
+    def _assert_clean_layout(lines: list[str], total_rows: int) -> None:
+        child_rows = total_rows - 2
+        prompt_start = child_rows - 6
+        # 1. Zero duplicate/ghost token bars anywhere in child viewport OR inside prompt box!
+        for r in range(child_rows):
+            assert "Tokens" not in lines[r], f"Ghost token bar on row {r + 1}: {lines[r]!r}"
+            assert "Explore" not in lines[r], f"Ghost category line on row {r + 1}: {lines[r]!r}"
+            assert "Cache:" not in lines[r], f"Ghost bar stats on row {r + 1}: {lines[r]!r}"
+            assert "█" not in lines[r] and "▓" not in lines[r], (
+                f"Ghost bar block glyph on row {r + 1}: {lines[r]!r}"
+            )
+
+        # 2. Prompt box at bottom of child_rows is 100% intact and unblocked
+        assert lines[prompt_start].startswith("┌─") and lines[prompt_start].endswith("┐")
+        assert lines[prompt_start + 1].startswith("│ > Type your prompt here...")
+        assert lines[prompt_start + 1].endswith("│")
+        assert lines[prompt_start + 2].startswith("│ ") and lines[prompt_start + 2].endswith("│")
+        assert lines[prompt_start + 2][1:-1].strip() == ""
+        assert "[Enter to send]" in lines[prompt_start + 3]
+        assert lines[prompt_start + 4].startswith("└─") and lines[prompt_start + 4].endswith("┘")
+        assert "gemini-2.5-pro" in lines[prompt_start + 5]
+
+        # 3. Exactly one 2-line token footer on the bottom 2 rows
+        assert "Tokens" in lines[total_rows - 2]
+        assert "Explore" in lines[total_rows - 1]
+
+    try:
+        # Phase 1: Initial 24x80 screen
+        snap_init = _wait_for_settled_screen(22, 80)
+        _assert_clean_layout(snap_init, 24)
+
+        # Phase 2: Double-click titlebar -> rapid 10-step full-screen zoom animation (24x80 -> 54x140)
+        zoom_steps = [
+            (26, 85),
+            (29, 92),
+            (32, 100),
+            (36, 108),
+            (40, 116),
+            (44, 124),
+            (48, 130),
+            (51, 135),
+            (53, 138),
+            (54, 140),
+        ]
+        for r_step, c_step in zoom_steps:
+            _apply_resize_step(r_step, c_step)
+            _drain_into_vt(0.012)
+
+        snap_fullscreen = _wait_for_settled_screen(52, 140)
+        _assert_clean_layout(snap_fullscreen, 54)
+
+        # Phase 3: Post-settle expand (54x140 -> 60x150) where new prompt box (53..58) lands
+        # directly on rows 53..54 previously occupied by the settled footer
+        _apply_resize_step(60, 150)
+        snap_expanded = _wait_for_settled_screen(58, 150)
+        _assert_clean_layout(snap_expanded, 60)
+
+        # Phase 4: Double-click titlebar again -> un-fullscreen animation back to 24x80
+        unzoom_steps = [
+            (52, 132),
+            (44, 118),
+            (36, 102),
+            (29, 90),
+            (24, 80),
+        ]
+        for r_step, c_step in unzoom_steps:
+            _apply_resize_step(r_step, c_step)
+            _drain_into_vt(0.012)
+
+        snap_restored = _wait_for_settled_screen(22, 80)
+        _assert_clean_layout(snap_restored, 24)
+
+        os.write(master_fd, b"q\n")
+        exit_deadline = time.monotonic() + 5.0
+        while proc.poll() is None and time.monotonic() < exit_deadline:
+            _drain_into_vt(0.05)
+        assert proc.wait(timeout=5) == 0
+    finally:
+        os.close(master_fd)
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+def test_normal_buffer_inline_tui_fullscreen_resize_never_duplicates_token_bars(
+    tmp_path: Path,
+) -> None:
+    """
+    Verify inline normal-screen mode (`agy` after `?1049l`) across an animated full-screen
+    resize (`24x80 -> ... -> 48x130`) leaves zero duplicate token bars above the footer.
+    """
+    fake_inline_agy = tmp_path / "fake_inline_agy"
+    fake_inline_agy.write_text(
+        """#!/usr/bin/env python3
+import fcntl, json, os, pathlib, select, signal, struct, sys, termios
+
+data_dir = os.environ.get("AGY_DATA_DIR")
+if data_dir:
+    logs = pathlib.Path(data_dir) / "brain" / "inline-resize-001" / ".system_generated" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    step = {
+        "step_index": 1,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "input_tokens": 2200,
+        "cache_read_tokens": 4000,
+        "output_tokens": 300,
+        "thinking": "Editing file",
+        "tool_calls": [{"name": "edit_file", "args": {"Path": "src/app.py"}}],
+    }
+    (logs / "transcript.jsonl").write_text(json.dumps(step) + "\\n", encoding="utf-8")
+
+wake_r, wake_w = os.pipe()
+os.set_blocking(wake_r, False)
+os.set_blocking(wake_w, False)
+resized = [True]
+
+def _on_winch(_s, _f):
+    resized[0] = True
+    try:
+        os.write(wake_w, b"W")
+    except OSError:
+        pass
+
+signal.signal(signal.SIGWINCH, _on_winch)
+
+def _winsize():
+    packed = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0))
+    r, c, _, _ = struct.unpack("HHHH", packed)
+    return max(6, r), max(20, c)
+
+# Simulate agy splash (?1049h) -> normal buffer (?1049l) inline prompt box
+sys.stdout.write("\\x1b[?1049h\\x1b[H\\x1b[2JSigning in...\\x1b[?1049l\\r\\x1b[J")
+sys.stdout.flush()
+
+prev_lines = 0
+while True:
+    if resized[0]:
+        resized[0] = False
+        rows, cols = _winsize()
+        if prev_lines > 1:
+            sys.stdout.write(f"\\x1b[{prev_lines - 1}A")
+        box_w = max(20, min(cols - 2, 70))
+        block = [
+            f"INLINE_READY_{rows}x{cols}",
+            "┌" + ("─" * (box_w - 2)) + "┐",
+            "│ > Ask Antigravity..." + (" " * max(0, box_w - 23)) + "│",
+            "└" + ("─" * (box_w - 2)) + "┘",
+        ]
+        sys.stdout.write("\\r\\x1b[J" + "\\r\\n".join(block))
+        sys.stdout.flush()
+        prev_lines = len(block)
+
+    try:
+        rlist, _, _ = select.select([sys.stdin.fileno(), wake_r], [], [], 0.2)
+    except InterruptedError:
+        continue
+    if wake_r in rlist:
+        try:
+            os.read(wake_r, 1024)
+        except OSError:
+            pass
+    if sys.stdin.fileno() in rlist:
+        data = os.read(sys.stdin.fileno(), 64)
+        if not data or b"q" in data:
+            break
+""",
+        encoding="utf-8",
+    )
+    fake_inline_agy.chmod(fake_inline_agy.stat().st_mode | stat.S_IXUSR)
+
+    master_fd, slave_fd = pty.openpty()
+    set_pty_winsize(slave_fd, 24, 80)
+    vt = _MiniVT100(rows=24, cols=80)
+
+    env = {
+        **os.environ,
+        "AGY_REAL_BIN": str(fake_inline_agy),
+        "AGY_DATA_DIR": str(tmp_path / "agy_inline_resize_data"),
+        "TERM": "xterm-256color",
+    }
+    proc = subprocess.Popen(
+        [str(BIN_AGY), "--visualize-tokens", "--viz-heuristic-only"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+
+    def _drain(duration: float) -> None:
+        end_at = time.monotonic() + duration
+        while True:
+            rem = end_at - time.monotonic()
+            if rem <= 0:
+                break
+            ready, _, _ = select.select([master_fd], [], [], min(0.02, rem))
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 16384)
+                    if chunk:
+                        vt.feed(chunk)
+                except OSError:
+                    break
+
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            _drain(0.03)
+            lines = vt.snapshot_lines()
+            if any("INLINE_READY_22x80" in l for l in lines) and "Tokens" in lines[22]:
+                break
+        else:
+            raise AssertionError("Timed out waiting for initial inline render")
+
+        for r_step, c_step in [(28, 90), (33, 100), (39, 112), (44, 122), (48, 130)]:
+            vt.resize(r_step, c_step)
+            set_pty_winsize(master_fd, r_step, c_step)
+            os.kill(proc.pid, signal.SIGWINCH)
+            _drain(0.012)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            _drain(0.03)
+            lines = vt.snapshot_lines()
+            if (
+                len(lines) == 48
+                and any("INLINE_READY_46x130" in l for l in lines[:46])
+                and "Tokens" in lines[46]
+                and "Code" in lines[47]
+            ):
+                break
+        else:
+            raise AssertionError(
+                "Timed out waiting for settled 48x130 inline render:\n"
+                + "\n".join(f"{i + 1:02d}: {l}" for i, l in enumerate(vt.snapshot_lines()))
+            )
+
+        lines = vt.snapshot_lines()
+        for r in range(46):
+            assert "Tokens" not in lines[r], f"Duplicate token bar on row {r + 1}: {lines[r]!r}"
+        assert any("│ > Ask Antigravity..." in l for l in lines[:46])
+        assert "Tokens" in lines[46]
+        assert "Code" in lines[47]
+
+        os.write(master_fd, b"q\n")
+        exit_deadline = time.monotonic() + 5.0
+        while proc.poll() is None and time.monotonic() < exit_deadline:
+            _drain(0.05)
+        assert proc.wait(timeout=5) == 0
+    finally:
+        os.close(master_fd)
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+def test_clamp_child_cursor_positions_prevents_footer_overwrites_and_size_probe_leaks() -> None:
+    # 1. Valid child cursor targets (<= child_rows) and non-cursor CSI pass through untouched
+    valid = b"\x1b[H\x1b[1;1H\x1b[22;80H\x1b[22d\x1b[38;2;255;100;50m\x1b[?25h"
+    assert clamp_child_cursor_positions(valid, child_rows=22) == valid
+
+    # 2. Out-of-bounds CUP (`H`), HVP (`f`), VPA (`d`), and `\x1b[999;999H\x1b[6n` size probes clamp to child_rows
+    raw = (
+        b"\x1b[23;1HFooterRow1"
+        b"\x1b[24;15fFooterRow2"
+        b"\x1b[30HColDefault"
+        b"\x1b[28;fEmptyCol"
+        b"\x1b[24dVPATarget"
+        b"\x1b[999;999H\x1b[6n"
+    )
+    assert clamp_child_cursor_positions(raw, child_rows=22) == (
+        b"\x1b[22;1HFooterRow1"
+        b"\x1b[22;15fFooterRow2"
+        b"\x1b[22HColDefault"
+        b"\x1b[22;fEmptyCol"
+        b"\x1b[22dVPATarget"
+        b"\x1b[22;999H\x1b[6n"
+    )
+
+
+def test_rewrite_terminal_input_events_adjusts_xtwinops_inband_2048_and_cpr_replies() -> None:
+    click_state = [False]
+    # 1. XTWINOPS text-area size report (`\x1b[8;rows;colst`) -> child_rows
+    assert (
+        rewrite_terminal_input_events(
+            b"\x1b[8;54;140t", child_rows=52, suppressing_click=click_state
+        )
+        == b"\x1b[8;52;140t"
+    )
+
+    # 2. DEC Mode 2048 in-band resize (`\x1b[48;rows;cols;px_h;px_wt`) -> child_rows & scaled pixel height
+    assert (
+        rewrite_terminal_input_events(
+            b"\x1b[48;54;140;1080;2800t",
+            child_rows=52,
+            suppressing_click=click_state,
+        )
+        == b"\x1b[48;52;140;1040;2800t"
+    )
+
+    # 3. CPR cursor position reply (`\x1b[row;colR`) clamps > child_rows while preserving Shift+F3 (`\x1b[1;2R`)
+    assert (
+        rewrite_terminal_input_events(
+            b"\x1b[54;80R\x1b[1;2R\x1b[20;10R",
+            child_rows=52,
+            suppressing_click=click_state,
+        )
+        == b"\x1b[52;80R\x1b[1;2R\x1b[20;10R"
+    )
+
+    # 4. Combined payload: footer click suppressed + in-band resize rewritten + normal keystrokes preserved
+    combined = b"\x1b[<0;12;53M\x1b[<0;12;53m\x1b[48;54;100;540;1000thello"
+    assert (
+        rewrite_terminal_input_events(
+            combined, child_rows=52, suppressing_click=click_state
+        )
+        == b"\x1b[48;52;100;520;1000thello"
+    )
+
+
+def test_erase_normal_footer_before_alt_screen_prevents_zombie_startup_bar_after_alt_resize(
+    tmp_path: Path,
+) -> None:
+    """
+    Verify both unit and end-to-end PTY behavior when launching at `24x80`, entering
+    alt-screen (`?1049h`), resizing to `44x120`, and exiting alt-screen (`?1049l`) back
+    to the normal screen buffer:
+    - The startup normal-buffer token bar drawn at rows `23..24` is erased *before*
+      `?1049h` saves the normal buffer, so rows `23..24` contain zero zombie bar remnants
+      when `?1049l` restores the normal screen at `44x120`.
+    """
+    in_alt = [False]
+    nf_state: list[tuple[int, int, int] | None] = [(24, 78, 70)]
+    out = erase_normal_footer_before_alt_screen(
+        b"pre\x1b[?1049hinside",
+        in_alt_screen=in_alt,
+        normal_footer_state=nf_state,
+    )
+    assert out == (
+        b"pre\x1b7\x1b[0m\x1b[23;1H\x1b[2K\x1b[24;1H\x1b[2K\x1b[r\x1b8\x1b[?1049hinside"
+    )
+    assert in_alt[0] is True
+    assert nf_state[0] is None
+
+    fake_alt_then_inline = tmp_path / "fake_alt_then_inline"
+    fake_alt_then_inline.write_text(
+        """#!/usr/bin/env python3
+import fcntl, json, os, pathlib, select, signal, struct, sys, termios, time
+
+data_dir = os.environ.get("JETSKI_DATA_DIR")
+if data_dir:
+    logs = pathlib.Path(data_dir) / "brain" / "alt-exit-001" / ".system_generated" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    step = {
+        "step_index": 1,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "input_tokens": 3000,
+        "cache_read_tokens": 5000,
+        "output_tokens": 400,
+        "tool_calls": [{"name": "read_file", "args": {"Path": "README.md"}}],
+    }
+    (logs / "transcript.jsonl").write_text(json.dumps(step) + "\\n", encoding="utf-8")
+
+wake_r, wake_w = os.pipe()
+os.set_blocking(wake_r, False)
+os.set_blocking(wake_w, False)
+resized = [True]
+
+def _on_winch(_s, _f):
+    resized[0] = True
+    try:
+        os.write(wake_w, b"W")
+    except OSError:
+        pass
+
+signal.signal(signal.SIGWINCH, _on_winch)
+
+def _winsize():
+    packed = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0))
+    r, c, _, _ = struct.unpack("HHHH", packed)
+    return max(1, r), max(1, c)
+
+# Print pre-alt banner on normal buffer, let startup footer settle, then enter ?1049h
+sys.stdout.write("PRE_ALT_BANNER_LINE\\r\\n")
+sys.stdout.flush()
+time.sleep(0.12)
+
+sys.stdout.write("\\x1b[?1049h")
+sys.stdout.flush()
+
+in_alt = True
+while True:
+    if resized[0]:
+        resized[0] = False
+        r, c = _winsize()
+        if in_alt:
+            sys.stdout.write(f"\\x1b[H\\x1b[2JALT_VIEW_{r}x{c}")
+            sys.stdout.flush()
+    try:
+        rlist, _, _ = select.select([sys.stdin.fileno(), wake_r], [], [], 0.2)
+    except InterruptedError:
+        continue
+    if wake_r in rlist:
+        try:
+            os.read(wake_r, 1024)
+        except OSError:
+            pass
+    if sys.stdin.fileno() in rlist:
+        cmd = os.read(sys.stdin.fileno(), 64)
+        if b"x" in cmd and in_alt:
+            in_alt = False
+            r, c = _winsize()
+            sys.stdout.write(f"\\x1b[?1049lPOST_ALT_NORMAL_{r}x{c}\\r\\n")
+            sys.stdout.flush()
+        if not cmd or b"q" in cmd:
+            break
+""",
+        encoding="utf-8",
+    )
+    fake_alt_then_inline.chmod(fake_alt_then_inline.stat().st_mode | stat.S_IXUSR)
+
+    master_fd, slave_fd = pty.openpty()
+    set_pty_winsize(slave_fd, 24, 80)
+    vt = _MiniVT100(rows=24, cols=80)
+    vt.feed(b"SHELL_HISTORY_TOP\r\n")
+
+    env = {
+        **os.environ,
+        "JETSKI_REAL_BIN": str(fake_alt_then_inline),
+        "JETSKI_DATA_DIR": str(tmp_path / "jetski_alt_exit_data"),
+        "TERM": "xterm-256color",
+    }
+    proc = subprocess.Popen(
+        [str(BIN_JETSKI), "--visualize-tokens", "--viz-heuristic-only"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+
+    def _drain(duration: float) -> None:
+        end_at = time.monotonic() + duration
+        while True:
+            rem = end_at - time.monotonic()
+            if rem <= 0:
+                break
+            ready, _, _ = select.select([master_fd], [], [], min(0.02, rem))
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 16384)
+                    if chunk:
+                        vt.feed(chunk)
+                except OSError:
+                    break
+
+    try:
+        # 1. Wait for alt-screen at 24x80 (`ALT_VIEW_22x80`)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            _drain(0.03)
+            lines = vt.snapshot_lines()
+            if "ALT_VIEW_22x80" in lines[0] and "Tokens" in lines[22]:
+                break
+        else:
+            raise AssertionError("Timed out waiting for ALT_VIEW_22x80")
+
+        # 2. Resize terminal while in alt-screen to 44x120
+        vt.resize(44, 120)
+        set_pty_winsize(master_fd, 44, 120)
+        os.kill(proc.pid, signal.SIGWINCH)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            _drain(0.03)
+            lines = vt.snapshot_lines()
+            if len(lines) == 44 and "ALT_VIEW_42x120" in lines[0] and "Tokens" in lines[42]:
+                break
+        else:
+            raise AssertionError("Timed out waiting for ALT_VIEW_42x120")
+
+        # 3. Tell child to exit `?1049l` back to normal screen while staying alive
+        os.write(master_fd, b"x\n")
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            _drain(0.03)
+            lines = vt.snapshot_lines()
+            if (
+                any("POST_ALT_NORMAL_42x120" in l for l in lines[:42])
+                and "Tokens" in lines[42]
+                and "Explore" in lines[43]
+            ):
+                break
+        else:
+            raise AssertionError(
+                "Timed out waiting for POST_ALT_NORMAL_42x120:\n"
+                + "\n".join(f"{i + 1:02d}: {l}" for i, l in enumerate(vt.snapshot_lines()))
+            )
+
+        # Verify ZERO zombie startup bar at old rows 23..24 (0-indexed 22..23) or anywhere in 0..41
+        lines = vt.snapshot_lines()
+        for r in range(42):
+            assert "Tokens" not in lines[r], f"Zombie startup bar on row {r + 1}: {lines[r]!r}"
+            assert "Explore" not in lines[r], f"Zombie category line on row {r + 1}: {lines[r]!r}"
+        assert any("SHELL_HISTORY_TOP" in l for l in lines[:10])
+        assert any("PRE_ALT_BANNER_LINE" in l for l in lines[:10])
+        assert "Tokens" in lines[42]
+        assert "Explore" in lines[43]
+
+        os.write(master_fd, b"q\n")
+        exit_deadline = time.monotonic() + 5.0
+        while proc.poll() is None and time.monotonic() < exit_deadline:
+            _drain(0.05)
+        assert proc.wait(timeout=5) == 0
+    finally:
+        os.close(master_fd)
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
+def test_normal_buffer_shrink_reflow_tiny_collapse_and_inband_stdin_resize(
+    tmp_path: Path,
+) -> None:
+    """
+    Verify remaining normal-buffer & protocol resize edge cases:
+    1. Normal-screen vertical shrink (`preserve_normal_cursor_above_footer=True`) scrolls
+       bottom-clamped prompt lines safely out of the new footer band without disturbing
+       cursors already above `new_child_rows`.
+    2. Normal-screen horizontal width shrink (`prev_normal_footer_vis_lens`) expands clear
+       range to erase reflow-wrapped footer lines.
+    3. End-to-end PTY run shrinks below `MIN_TERMINAL_ROWS_FOR_FOOTER` (`30x100 -> 4x70`),
+       recovers to `26x95`, and rewrites DEC Mode 2048 (`\\x1b[48;...t`) and `XTWINOPS`
+       (`\\x1b[8;...t`) events arriving on `stdin` to `child_rows` (`24`).
+    """
+    # 1a. Bottom-clamped cursor in normal screen during shrink (30 -> 20, new_child_rows=18):
+    vt_bottom = _MiniVT100(rows=30, cols=80)
+    vt_bottom.feed(b"\x1b[28;1HPROMPT_AT_BOTTOM")
+    vt_bottom.resize(20, 80)  # Terminal clamps cursor & bottom line or leaves line at row 20
+    vt_bottom.grid[19][:16] = list("CLAMPED_PROMPT_X")
+    vt_bottom.row = 19
+    seq_shrink = build_resize_transition_sequence(
+        prev_rows=30,
+        prev_use_footer=True,
+        new_rows=20,
+        new_use_footer=True,
+        preserve_normal_cursor_above_footer=True,
+    )
+    vt_bottom.feed(seq_shrink)
+    snap_b = vt_bottom.snapshot_lines()
+    assert snap_b[17] == "CLAMPED_PROMPT_X"  # Scrolled safely up to row 18 (0-idx 17)!
+    assert snap_b[18] == "" and snap_b[19] == ""
+    assert vt_bottom.row == 17
+
+    # 1b. Cursor already above footer (row 5) during normal-screen shrink: zero unwanted scroll!
+    vt_top = _MiniVT100(rows=30, cols=80)
+    vt_top.feed(b"\x1b[1;1HTOP_LINE_1\x1b[5;1HPROMPT_ROW_5")
+    vt_top.resize(20, 80)
+    vt_top.feed(seq_shrink)
+    snap_t = vt_top.snapshot_lines()
+    assert snap_t[0] == "TOP_LINE_1"
+    assert snap_t[4] == "PROMPT_ROW_5"
+    assert vt_top.row == 4
+
+    # 2. Width-only narrow in normal screen (48x140 -> 48x60) clears wrapped footer rows (45..48)
+    seq_narrow = build_resize_transition_sequence(
+        prev_rows=48,
+        prev_use_footer=True,
+        new_rows=48,
+        new_use_footer=True,
+        preserve_normal_cursor_above_footer=True,
+        new_cols=60,
+        prev_normal_footer_vis_lens=(115, 95),
+    )
+    assert seq_narrow == b"\x1b7\x1b[0m\x1b[1;46r\x1b[45;1H\x1b[J\x1b8"
+
+    # 3. End-to-end PTY test: 30x100 -> tiny 4x70 (with ?1049h/?1049l) -> 26x95 + in-band stdin resize
+    fake_tiny_and_inband = tmp_path / "fake_tiny_and_inband"
+    fake_tiny_and_inband.write_text(
+        """#!/usr/bin/env python3
+import fcntl, json, os, pathlib, select, signal, struct, sys, termios, tty
+
+data_dir = os.environ.get("AGY_DATA_DIR")
+if data_dir:
+    logs = pathlib.Path(data_dir) / "brain" / "tiny-inband-001" / ".system_generated" / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    step = {
+        "step_index": 1,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "input_tokens": 1800,
+        "cache_read_tokens": 3200,
+        "output_tokens": 250,
+        "tool_calls": [{"name": "edit_file", "args": {"Path": "src/main.py"}}],
+    }
+    (logs / "transcript.jsonl").write_text(json.dumps(step) + "\\n", encoding="utf-8")
+
+tty.setraw(sys.stdin.fileno())
+wake_r, wake_w = os.pipe()
+os.set_blocking(wake_r, False)
+os.set_blocking(wake_w, False)
+resized = [True]
+
+def _on_winch(_s, _f):
+    resized[0] = True
+    try:
+        os.write(wake_w, b"W")
+    except OSError:
+        pass
+
+signal.signal(signal.SIGWINCH, _on_winch)
+
+def _winsize():
+    packed = fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0))
+    r, c, _, _ = struct.unpack("HHHH", packed)
+    return max(1, r), max(1, c)
+
+while True:
+    if resized[0]:
+        resized[0] = False
+        r, c = _winsize()
+        if r == 4:
+            # Exercise alt-screen enter/exit while footer is disabled (< 6 rows)
+            sys.stdout.write(f"\\x1b[?1049hTINY_ALT\\x1b[?1049l\\r\\nTINY_NORM_{r}x{c}\\r\\n")
+        else:
+            sys.stdout.write(f"\\r\\nSIZE_NOW_{r}x{c}\\r\\n")
+        sys.stdout.flush()
+    try:
+        rlist, _, _ = select.select([sys.stdin.fileno(), wake_r], [], [], 0.2)
+    except InterruptedError:
+        continue
+    if wake_r in rlist:
+        try:
+            os.read(wake_r, 1024)
+        except OSError:
+            pass
+    if sys.stdin.fileno() in rlist:
+        data = os.read(sys.stdin.fileno(), 256)
+        if not data or b"q" in data:
+            break
+        escaped = data.decode("latin1").replace("\\x1b", "ESC")
+        sys.stdout.write(f"\\r\\nSTDIN_SEEN<{escaped}>\\r\\n")
+        sys.stdout.flush()
+""",
+        encoding="utf-8",
+    )
+    fake_tiny_and_inband.chmod(fake_tiny_and_inband.stat().st_mode | stat.S_IXUSR)
+
+    master_fd, slave_fd = pty.openpty()
+    set_pty_winsize(slave_fd, 30, 100)
+    vt = _MiniVT100(rows=30, cols=100)
+
+    env = {
+        **os.environ,
+        "AGY_REAL_BIN": str(fake_tiny_and_inband),
+        "AGY_DATA_DIR": str(tmp_path / "agy_tiny_inband_data"),
+        "TERM": "xterm-256color",
+    }
+    proc = subprocess.Popen(
+        [str(BIN_AGY), "--visualize-tokens", "--viz-heuristic-only"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        env=env,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+
+    def _drain(duration: float) -> None:
+        end_at = time.monotonic() + duration
+        while True:
+            rem = end_at - time.monotonic()
+            if rem <= 0:
+                break
+            ready, _, _ = select.select([master_fd], [], [], min(0.02, rem))
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 16384)
+                    if chunk:
+                        vt.feed(chunk)
+                except OSError:
+                    break
+
+    try:
+        # Phase 1: Initial 30x100 (`child_rows=28`)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            _drain(0.03)
+            lines = vt.snapshot_lines()
+            if any("SIZE_NOW_28x100" in l for l in lines[:28]) and "Tokens" in lines[28]:
+                break
+        else:
+            raise AssertionError("Timed out waiting for SIZE_NOW_28x100")
+
+        # Phase 2: Shrink to 4x70 (< MIN_TERMINAL_ROWS_FOR_FOOTER -> child gets full 4x70, no footer)
+        vt.resize(4, 70)
+        set_pty_winsize(master_fd, 4, 70)
+        os.kill(proc.pid, signal.SIGWINCH)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            _drain(0.03)
+            lines = vt.snapshot_lines()
+            if any("TINY_NORM_4x70" in l for l in lines):
+                break
+        else:
+            raise AssertionError("Timed out waiting for TINY_NORM_4x70")
+
+        lines_tiny = vt.snapshot_lines()
+        assert all("Tokens" not in l for l in lines_tiny)
+
+        # Phase 3: Expand back to 26x95 (`child_rows=24`, footer resumes on rows 25..26)
+        vt.resize(26, 95)
+        set_pty_winsize(master_fd, 26, 95)
+        os.kill(proc.pid, signal.SIGWINCH)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            _drain(0.03)
+            lines = vt.snapshot_lines()
+            if (
+                len(lines) == 26
+                and any("SIZE_NOW_24x95" in l for l in lines[:24])
+                and "Tokens" in lines[24]
+                and "Code" in lines[25]
+            ):
+                break
+        else:
+            raise AssertionError("Timed out waiting for SIZE_NOW_24x95 + recovered footer")
+
+        # Phase 4: Send DEC Mode 2048 + XTWINOPS + CPR on stdin -> rewritten to child_rows=24
+        os.write(master_fd, b"\x1b[48;26;95;520;950t\x1b[8;26;95t\x1b[26;10R")
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            _drain(0.03)
+            lines = vt.snapshot_lines()
+            if any(
+                "STDIN_SEEN<ESC[48;24;95;480;950tESC[8;24;95tESC[24;10R>" in l
+                for l in lines[:24]
+            ):
+                break
+        else:
+            raise AssertionError(
+                "Timed out waiting for rewritten stdin events:\n"
+                + "\n".join(f"{i + 1:02d}: {l}" for i, l in enumerate(vt.snapshot_lines()))
+            )
+
+        os.write(master_fd, b"q")
+        exit_deadline = time.monotonic() + 5.0
+        while proc.poll() is None and time.monotonic() < exit_deadline:
+            _drain(0.05)
+        assert proc.wait(timeout=5) == 0
+    finally:
+        os.close(master_fd)
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
 
 
 

@@ -252,6 +252,9 @@ def main(
 
     def _before_spawn() -> None:
         watcher.capture_baseline()
+
+    def _after_spawn(child_pid: int) -> None:
+        watcher.set_child_pid(child_pid)
         classifier.start()
         watcher.start()
 
@@ -262,7 +265,7 @@ def main(
 
     exit_code = runner.run(
         on_before_spawn=_before_spawn,
-        on_process_spawn=watcher.set_child_pid,
+        on_process_spawn=_after_spawn,
     )
 
     # Flush final transcript lines and let pending step classifications finish

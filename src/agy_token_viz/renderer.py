@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from typing import Sequence
+import unicodedata
 
 from agy_token_viz.config import SHORT_CATEGORY_LABELS
 from agy_token_viz.state import CategorySnapshot, LedgerSnapshot
@@ -37,13 +38,28 @@ def should_use_color(env: dict[str, str] | None = None) -> bool:
     return True
 
 
+def char_display_width(ch: str) -> int:
+    """Return terminal column width of a single Unicode character (0, 1, or 2)."""
+    if not ch:
+        return 0
+    if unicodedata.combining(ch):
+        return 0
+    cat = unicodedata.category(ch)
+    if cat in ("Cc", "Cf", "Mn", "Me"):
+        return 0
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
 def visible_len(text: str) -> int:
-    """Return display character count excluding ANSI CSI escape sequences."""
-    return len(_ANSI_ESCAPE_RE.sub("", text))
+    """Return terminal display column width excluding ANSI CSI escape sequences."""
+    stripped = _ANSI_ESCAPE_RE.sub("", text)
+    return sum(char_display_width(ch) for ch in stripped)
 
 
 def truncate_visible(text: str, max_cols: int, use_color: bool = True) -> str:
-    """Truncate a string containing ANSI codes so its visible length never exceeds max_cols."""
+    """Truncate a string containing ANSI codes so its visible column width never exceeds max_cols."""
     if max_cols <= 0:
         return ""
     if visible_len(text) <= max_cols:
@@ -59,8 +75,12 @@ def truncate_visible(text: str, max_cols: int, use_color: bool = True) -> str:
             out.append(match.group(0))
             idx = match.end()
             continue
-        out.append(text[idx])
-        vis += 1
+        ch = text[idx]
+        w = char_display_width(ch)
+        if vis + w > max_cols:
+            break
+        out.append(ch)
+        vis += w
         idx += 1
 
     if use_color:
@@ -151,7 +171,8 @@ def render_status_lines(
     Line 1: Total active tokens + proportional category bar + In/Cache/Out + step/router status
     Line 2: Per-category running tally with token counts and percentages
     """
-    width = max(20, int(cols))
+    target_cols = max(1, int(cols))
+    width = max(20, target_cols)
 
     total_str = format_token_count(snapshot.total_active_tokens)
     in_str = format_token_count(snapshot.total_input_tokens)
@@ -245,6 +266,10 @@ def render_status_lines(
         line2 = line2_med
     else:
         line2 = truncate_visible(line2_narrow, width, use_color=use_color)
+
+    if target_cols < width:
+        line1 = truncate_visible(line1, target_cols, use_color=use_color)
+        line2 = truncate_visible(line2, target_cols, use_color=use_color)
 
     return line1, line2
 
